@@ -42,6 +42,20 @@ PEXELS_API_KEY_HELP_URL = (
     "900004904026-How-do-I-get-an-API-key"
 )
 
+
+def _is_pilot_mode() -> bool:
+    """Return True when BrainTrustCrypto pilot mode is active.
+
+    This helper is intentionally standalone (duplicated from
+    app/services/pilot_policy.py) because docs/skill/mpt_agent.py is a
+    self-contained skill script that may be copied and executed outside the
+    application package. Importing the application policy module would make
+    the skill non-standalone. The check uses the exact normalized value
+    "braintrustcrypto" to stay consistent with the application policy.
+    """
+    return os.getenv("MPT_PILOT_PROFILE", "").strip().lower() == "braintrustcrypto"
+
+
 # Keep the recommended list focused on commonly used providers. When an LLM
 # key is missing, the helper emits all choices at once to avoid extra turns.
 RECOMMENDED_LLM_PROVIDERS = {
@@ -117,6 +131,13 @@ def _safe_extract(archive: zipfile.ZipFile, destination: Path) -> None:
 
 def ensure_project(root: Path) -> None:
     """Reuse an existing project or install it from the official GitHub archive."""
+    # Phase 1B.2D.1: Block bootstrap downloads in pilot mode
+    if _is_pilot_mode():
+        raise SkillError(
+            "BrainTrustCrypto pilot mode prohibits automatic project bootstrap "
+            "downloads. The project must already exist at the specified root."
+        )
+
     root = root.expanduser().resolve()
     if (root / "cli.py").is_file() and (root / "config.example.toml").is_file():
         log(f"using existing project: {root}")
@@ -515,6 +536,13 @@ def generate_video(
     cli_args: list[str],
 ) -> tuple[list[Path], Path, Path, Path]:
     """Run one traceable CLI task and return only its final video files."""
+    # Phase 1B.2D.1: Block subprocess execution in pilot mode
+    if _is_pilot_mode():
+        raise SkillError(
+            "BrainTrustCrypto pilot mode prohibits subprocess execution. "
+            "Video generation is disabled."
+        )
+
     uv = shutil.which("uv")
     if not uv:
         raise SkillError("uv was not found; reopen the terminal or add uv to PATH")
