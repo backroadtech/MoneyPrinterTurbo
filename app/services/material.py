@@ -16,7 +16,7 @@ from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
 from app.services import material_cache, task_artifacts, volcengine_seedance
 from app.services.pilot_policy import get_pilot_policy, PilotPolicyError
 from app.utils import utils
-from app.utils.egress import EgressPolicy, safe_download
+from app.utils.egress import EgressPolicy, safe_download, safe_json_get
 
 # Thread-safe counter for API key rotation
 _api_key_counter = 0
@@ -295,6 +295,110 @@ def _filter_materials_by_aspect(
     return filtered_items
 
 
+def _search_videos_pexels_pilot(
+    search_term: str,
+    minimum_duration: int,
+    aspect: VideoAspect,
+    video_orientation: str,
+    video_width: int,
+    video_height: int,
+) -> List[MaterialInfo]:
+    """
+    BrainTrustCrypto pilot-mode Pexels search.
+
+    Always uses safe_json_get; no direct requests fallback. Fails closed on
+    missing allowlist or missing API key (key is never logged).
+    """
+    policy = get_pilot_policy()
+    if policy is None:
+        raise PilotPolicyError("pilot policy not loaded")
+
+    allowed_hosts = policy.egress_allowed_hosts
+    if not allowed_hosts:
+        raise PilotPolicyError(
+            "pilot egress allowlist is missing or empty; refusing Pexels search"
+        )
+
+    api_key = get_api_key("pexels_api_keys")
+    if not api_key:
+        raise PilotPolicyError(
+            "pilot mode requires pexels_api_keys to be configured; "
+            "API key is missing"
+        )
+
+    egress_policy = EgressPolicy(allowed_hosts=allowed_hosts)
+
+    params = {"query": search_term, "per_page": 20, "orientation": video_orientation}
+    query_url = f"https://api.pexels.com/v1/videos/search?{urlencode(params)}"
+    logger.info(f"searching videos on pexels (pilot): term={search_term!r}")
+
+    headers = {
+        "Authorization": api_key,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    }
+
+    try:
+        response = safe_json_get(
+            query_url,
+            egress_policy,
+            headers=headers,
+            audit_logger=logger,
+            secrets_to_redact=(api_key,),
+        )
+    except Exception as e:
+        logger.error(
+            "pexels video search failed (pilot): "
+            f"error={type(e).__name__}, detail={_redact_request_error(e, api_key)}"
+        )
+        return []
+
+    video_items: List[MaterialInfo] = []
+    if not isinstance(response, dict) or "videos" not in response:
+        logger.error("pexels video search returned an unsupported response (pilot)")
+        return video_items
+    videos = response["videos"]
+    for v in videos:
+        duration = v["duration"]
+        if duration < minimum_duration:
+            continue
+        video_files = v["video_files"]
+        for video in video_files:
+            w = int(video["width"])
+            h = int(video["height"])
+            if (
+                _matches_video_aspect(w, h, aspect)
+                and w == video_width
+                and h == video_height
+            ):
+                item = MaterialInfo()
+                item.provider = "pexels"
+                # URLs from the API response are NOT implicitly trusted;
+                # save_video re-validates them through safe egress.
+                item.url = video["link"]
+                item.duration = duration
+                item.source_info = {
+                    "provider": "pexels",
+                    "search_term": search_term,
+                    "asset_id": (
+                        str(v.get("id")) if v.get("id") is not None else None
+                    ),
+                    "source_page": _safe_public_url(v.get("url")),
+                    "creator": _creator_info(v.get("user")),
+                    "rendition": {
+                        "id": (
+                            str(video.get("id"))
+                            if video.get("id") is not None
+                            else None
+                        ),
+                        "width": w,
+                        "height": h,
+                    },
+                }
+                video_items.append(item)
+                break
+    return video_items
+
+
 def search_videos_pexels(
     search_term: str,
     minimum_duration: int,
@@ -303,6 +407,18 @@ def search_videos_pexels(
     aspect = VideoAspect(video_aspect)
     video_orientation = aspect.name
     video_width, video_height = aspect.to_resolution()
+
+    # BrainTrustCrypto pilot mode: always use safe egress, no fallback.
+    if get_pilot_policy() is not None:
+        return _search_videos_pexels_pilot(
+            search_term,
+            minimum_duration,
+            aspect,
+            video_orientation,
+            video_width,
+            video_height,
+        )
+
     api_key = get_api_key("pexels_api_keys")
     headers = {
         "Authorization": api_key,

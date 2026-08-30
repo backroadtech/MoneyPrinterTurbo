@@ -25,6 +25,7 @@ from app.utils.egress import (
     RedirectLimitExceededError,
     SizeLimitExceededError,
     URLValidationError,
+    MalformedJSONError,
     _get_mime_category,
     _is_hostname_allowed,
     _normalize_hostname,
@@ -32,6 +33,7 @@ from app.utils.egress import (
     _validate_mime_type,
     safe_api_request,
     safe_download,
+    safe_json_get,
     validate_url,
 )
 
@@ -941,3 +943,244 @@ class TestEdgeCases:
         )
 
         assert dest.read_bytes() == body
+
+
+# ---------------------------------------------------------------------------
+# safe_json_get tests (Phase 1B.2C.2)
+# ---------------------------------------------------------------------------
+
+
+class TestSafeJsonGet:
+    def test_successful_json_get(self, default_policy, mock_resolver_public):
+        body = b'{"videos": []}'
+        mock_response = _make_mock_response(
+            content_type="application/json",
+            content_length=len(body),
+            body=body,
+        )
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        result = safe_json_get(
+            "https://example.com/api/search?query=nature",
+            default_policy,
+            session=mock_session,
+            resolver=mock_resolver_public,
+        )
+        assert result == {"videos": []}
+
+    def test_redirects_rejected(self, default_policy, mock_resolver_public):
+        mock_response = _make_mock_response(
+            content_type="application/json", body=b"{}",
+        )
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        safe_json_get(
+            "https://example.com/api/data",
+            default_policy,
+            session=mock_session,
+            resolver=mock_resolver_public,
+        )
+        call_kwargs = mock_session.get.call_args[1]
+        assert call_kwargs["allow_redirects"] is False
+
+    def test_private_ip_rejected(self, default_policy, mock_resolver_factory):
+        resolver = mock_resolver_factory(["192.168.1.1"])
+        mock_session = MagicMock(spec=requests.Session)
+        with pytest.raises(IPBlockedError):
+            safe_json_get(
+                "https://example.com/api/data",
+                default_policy,
+                session=mock_session,
+                resolver=resolver,
+            )
+        mock_session.get.assert_not_called()
+
+    def test_invalid_mime_rejected(self, default_policy, mock_resolver_public):
+        mock_response = _make_mock_response(
+            content_type="text/html", body=b"<html></html>",
+        )
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        with pytest.raises(MIMETypeNotAllowedError):
+            safe_json_get(
+                "https://example.com/api/data",
+                default_policy,
+                session=mock_session,
+                resolver=mock_resolver_public,
+            )
+
+    def test_oversized_declared_body_rejected(self, default_policy, mock_resolver_public):
+        mock_response = _make_mock_response(
+            content_type="application/json",
+            content_length=11 * 1024 * 1024,
+        )
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        with pytest.raises(SizeLimitExceededError, match="Content-Length"):
+            safe_json_get(
+                "https://example.com/api/data",
+                default_policy,
+                session=mock_session,
+                resolver=mock_resolver_public,
+            )
+
+    def test_oversized_actual_body_rejected(self, default_policy, mock_resolver_public):
+        chunk = b"x" * (1024 * 1024)
+        chunks = [chunk] * 11  # 11 MB actual, no Content-Length
+        mock_response = _make_mock_response(
+            content_type="application/json",
+            content_length=None,
+            chunks=chunks,
+        )
+        mock_response.headers.pop("Content-Length", None)
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        with pytest.raises(SizeLimitExceededError, match="response body"):
+            safe_json_get(
+                "https://example.com/api/data",
+                default_policy,
+                session=mock_session,
+                resolver=mock_resolver_public,
+            )
+
+    def test_malformed_json_rejected(self, default_policy, mock_resolver_public):
+        mock_response = _make_mock_response(
+            content_type="application/json",
+            body=b"{not valid json",
+        )
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        with pytest.raises(MalformedJSONError):
+            safe_json_get(
+                "https://example.com/api/data",
+                default_policy,
+                session=mock_session,
+                resolver=mock_resolver_public,
+            )
+
+    def test_timeout_propagates(self, default_policy, mock_resolver_public):
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.side_effect = requests.Timeout("read timed out")
+
+        with pytest.raises(requests.Timeout):
+            safe_json_get(
+                "https://example.com/api/data",
+                default_policy,
+                session=mock_session,
+                resolver=mock_resolver_public,
+            )
+
+    def test_http_error_propagates(self, default_policy, mock_resolver_public):
+        mock_response = _make_mock_response(
+            content_type="application/json", body=b"{}",
+        )
+        mock_response.raise_for_status = Mock(
+            side_effect=requests.HTTPError("403 Forbidden")
+        )
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        with pytest.raises(requests.HTTPError):
+            safe_json_get(
+                "https://example.com/api/data",
+                default_policy,
+                session=mock_session,
+                resolver=mock_resolver_public,
+            )
+
+    def test_timeouts_from_policy(self, mock_resolver_public):
+        policy = EgressPolicy(
+            allowed_hosts=frozenset({"example.com"}),
+            connect_timeout=7.0,
+            read_timeout=13.0,
+        )
+        mock_response = _make_mock_response(
+            content_type="application/json", body=b"{}",
+        )
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        safe_json_get(
+            "https://example.com/api/data",
+            policy,
+            session=mock_session,
+            resolver=mock_resolver_public,
+        )
+        call_kwargs = mock_session.get.call_args[1]
+        assert call_kwargs["timeout"] == (7.0, 13.0)
+
+    def test_query_string_redacted_from_audit(self, default_policy, mock_resolver_public, caplog):
+        body = b"{}"
+        mock_response = _make_mock_response(
+            content_type="application/json", body=body,
+        )
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        with caplog.at_level(logging.INFO):
+            safe_json_get(
+                "https://example.com/api/data?api_key=***",
+                default_policy,
+                session=mock_session,
+                resolver=mock_resolver_public,
+            )
+        success_records = [
+            r for r in caplog.records if "egress_json_success" in r.message
+        ]
+        assert success_records
+        for record in success_records:
+            event = record.__dict__.get("egress_event", {})
+            assert "secret" not in str(event)
+            assert "api_key" not in str(event.get("url", ""))
+
+    def test_secret_redacted_from_failure_log(self, default_policy, mock_resolver_public, caplog):
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.side_effect = requests.ConnectionError(
+            "connection failed for key=my-secret-api-key-12345"
+        )
+
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(requests.ConnectionError):
+                safe_json_get(
+                    "https://example.com/api/data",
+                    default_policy,
+                    session=mock_session,
+                    resolver=mock_resolver_public,
+                    secrets_to_redact=("my-secret-api-key-12345",),
+                )
+        failure_records = [
+            r for r in caplog.records if "egress_json_failure" in r.message
+        ]
+        assert failure_records
+        for record in failure_records:
+            event = record.__dict__.get("egress_event", {})
+            assert "my-secret-api-key-12345" not in str(event)
+
+    def test_https_only(self, default_policy, mock_resolver_public):
+        mock_session = MagicMock(spec=requests.Session)
+        with pytest.raises(URLValidationError):
+            safe_json_get(
+                "http://example.com/api/data",
+                default_policy,
+                session=mock_session,
+                resolver=mock_resolver_public,
+            )
+        mock_session.get.assert_not_called()
+
+    def test_host_not_in_allowlist_rejected(self, mock_resolver_public):
+        policy = EgressPolicy(allowed_hosts=frozenset({"api.pexels.com"}))
+        mock_session = MagicMock(spec=requests.Session)
+        with pytest.raises(URLValidationError):
+            safe_json_get(
+                "https://evil.example.com/api/data",
+                policy,
+                session=mock_session,
+                resolver=mock_resolver_public,
+            )
+        mock_session.get.assert_not_called()

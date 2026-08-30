@@ -42,7 +42,7 @@ video_source = "local"
 source = "none"
 
 [egress]
-# Future egress controls will centrally enforce:
+# Egress controls centrally enforce:
 #   - HTTPS only
 #   - Approved hosts (allowlist)
 #   - Redirect revalidation
@@ -51,8 +51,20 @@ source = "none"
 #   - Content-type checks
 #   - Blocking of loopback/private/link-local destinations
 #
-# For Phase 1A, no external calls are expected.
+# Phase 1B.2C: save_video and Pexels search use these settings in pilot mode.
+# Missing or empty allowed_hosts fails closed (all egress refused).
+#
+# Hostname allowlist: exact matches or boundary-safe subdomain rules.
+# Example: "api.pexels.com" matches exactly; "*.pexels.com" matches subdomains.
+# Leave empty until Rick approves real hosts — empty fails closed.
 allowed_hosts = []
+
+# Redirect policy for media downloads (save_video).
+# API/JSON calls always reject redirects regardless of this setting.
+allow_redirects = false
+# Maximum revalidated redirects when allow_redirects = true. Capped at 3.
+max_redirects = 3
+
 blocked_hosts = [
   "*.tiktok.com",
   "*.instagram.com",

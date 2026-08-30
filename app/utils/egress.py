@@ -12,6 +12,7 @@ container/firewall egress isolation for complete protection.
 """
 
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -22,7 +23,7 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import BinaryIO, Callable, Iterable, Optional
+from typing import Any, BinaryIO, Callable, Iterable, Optional
 from urllib.parse import urlparse, urlunparse
 
 import requests
@@ -48,6 +49,10 @@ class SizeLimitExceededError(EgressPolicyError):
 
 class MIMETypeNotAllowedError(EgressPolicyError):
     """Response Content-Type is not in the allowlist."""
+
+
+class MalformedJSONError(EgressPolicyError):
+    """Response body is not valid JSON."""
 
 
 class RedirectLimitExceededError(EgressPolicyError):
@@ -631,4 +636,156 @@ def safe_api_request(
             error=str(exc),
         )
         audit_logger.warning("egress_api_failure", extra={"egress_event": event.to_dict()})
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Safe JSON GET primitive (Phase 1B.2C.2)
+# ---------------------------------------------------------------------------
+
+_SENSITIVE_HEADER_NAMES = frozenset(
+    {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key"}
+)
+
+
+def _redact_sensitive_text(text: str, secrets: Iterable[str]) -> str:
+    """Redact each non-empty secret from text."""
+    redacted = text
+    for secret in secrets:
+        secret_str = str(secret or "")
+        if secret_str:
+            redacted = redacted.replace(secret_str, "***")
+    return redacted
+
+
+def safe_json_get(
+    url: str,
+    policy: EgressPolicy,
+    *,
+    headers: Optional[dict[str, str]] = None,
+    session: Optional[requests.Session] = None,
+    resolver: Optional[Callable[[str], Iterable[str]]] = None,
+    audit_logger: Optional[logging.Logger] = None,
+    secrets_to_redact: Iterable[str] = (),
+) -> Any:
+    """
+    Safely fetch a JSON document with full policy enforcement.
+
+    Enforcement:
+    - HTTPS only, hostname allowlist, DNS/IP blocklist (via validate_url)
+    - Redirects always rejected
+    - Connect/read timeouts from policy
+    - Content-Length precheck (10 MB JSON limit from policy)
+    - Actual body size capped at policy.max_bytes_json_api
+    - JSON-compatible Content-Type required
+    - Malformed JSON rejected
+    - Query strings redacted from audit URLs; secrets redacted from errors
+
+    Returns the parsed JSON object. Raises EgressPolicyError subclasses on
+    policy violations; requests exceptions on network failures.
+    """
+    if audit_logger is None:
+        audit_logger = logger
+
+    # API calls never follow redirects
+    api_policy = EgressPolicy(
+        allowed_hosts=policy.allowed_hosts,
+        max_bytes_json_api=policy.max_bytes_json_api,
+        max_bytes_image=policy.max_bytes_image,
+        max_bytes_audio=policy.max_bytes_audio,
+        max_bytes_video=policy.max_bytes_video,
+        allow_redirects=False,
+        max_redirects=0,
+        connect_timeout=policy.connect_timeout,
+        read_timeout=policy.read_timeout,
+        allowed_mime_json_api=policy.allowed_mime_json_api,
+        allowed_mime_image=policy.allowed_mime_image,
+        allowed_mime_audio=policy.allowed_mime_audio,
+        allowed_mime_video=policy.allowed_mime_video,
+        blocked_networks=policy.blocked_networks,
+    )
+
+    # Validate URL (HTTPS, allowlist, DNS/IP blocklist)
+    normalized_url = validate_url(url, api_policy, resolver=resolver)
+
+    if session is None:
+        session = requests.Session()
+
+    max_bytes = api_policy.max_bytes_json_api
+    bytes_received = 0
+
+    # Sanitize headers for logging: never log sensitive header values
+    safe_headers = dict(headers or {})
+
+    try:
+        response = session.get(
+            normalized_url,
+            headers=safe_headers,
+            stream=True,
+            timeout=(api_policy.connect_timeout, api_policy.read_timeout),
+            allow_redirects=False,
+            verify=True,
+        )
+        response.raise_for_status()
+
+        # Validate Content-Type is JSON-compatible
+        content_type = response.headers.get("Content-Type", "")
+        _validate_mime_type(content_type, api_policy)
+
+        # Content-Length precheck
+        content_length = response.headers.get("Content-Length")
+        if content_length:
+            try:
+                declared_size = int(content_length)
+                if declared_size > max_bytes:
+                    raise SizeLimitExceededError(
+                        f"Content-Length {declared_size} exceeds limit "
+                        f"{max_bytes} for JSON/API"
+                    )
+            except ValueError:
+                pass
+
+        # Read body with actual-size enforcement
+        body = bytearray()
+        for chunk in response.iter_content(chunk_size=8192):
+            if not chunk:
+                continue
+            bytes_received += len(chunk)
+            if bytes_received > max_bytes:
+                raise SizeLimitExceededError(
+                    f"response body {bytes_received} exceeds limit "
+                    f"{max_bytes} for JSON/API"
+                )
+            body.extend(chunk)
+
+        # Parse JSON; reject malformed
+        try:
+            parsed = json.loads(bytes(body).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise MalformedJSONError(
+                f"response body is not valid JSON: {type(exc).__name__}"
+            ) from exc
+
+        # Audit success (URL sanitized by EgressAuditEvent)
+        event = EgressAuditEvent(
+            operation="json_get",
+            url=normalized_url,
+            status="success",
+            bytes_transferred=bytes_received,
+        )
+        audit_logger.info("egress_json_success", extra={"egress_event": event.to_dict()})
+
+        return parsed
+
+    except Exception as exc:
+        # Redact secrets from error text before logging
+        safe_error = _redact_sensitive_text(str(exc), secrets_to_redact)
+        event = EgressAuditEvent(
+            operation="json_get",
+            url=normalized_url,
+            status="failure",
+            bytes_transferred=bytes_received,
+            error=safe_error,
+        )
+        audit_logger.warning("egress_json_failure", extra={"egress_event": event.to_dict()})
         raise
