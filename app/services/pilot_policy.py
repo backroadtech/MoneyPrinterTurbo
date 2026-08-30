@@ -106,6 +106,40 @@ class PilotPolicy:
         """True when the BrainTrustCrypto pilot profile is explicitly selected."""
         return os.getenv("MPT_PILOT_PROFILE", "").strip().lower() == "braintrustcrypto"
 
+    @property
+    def egress_allowed_hosts(self) -> frozenset[str]:
+        """
+        Return the egress hostname allowlist from hardening.toml.
+
+        Missing or empty allowlist fails closed (returns empty frozenset).
+        """
+        egress = self._raw.get("egress", {})
+        if not isinstance(egress, dict):
+            return frozenset()
+        hosts = egress.get("allowed_hosts", [])
+        if not isinstance(hosts, list):
+            return frozenset()
+        return frozenset(str(h).strip() for h in hosts if h and str(h).strip())
+
+    @property
+    def egress_allow_redirects(self) -> bool:
+        """Whether redirects are allowed for media downloads."""
+        egress = self._raw.get("egress", {})
+        if not isinstance(egress, dict):
+            return False
+        return bool(egress.get("allow_redirects", False))
+
+    @property
+    def egress_max_redirects(self) -> int:
+        """Maximum number of revalidated redirects."""
+        egress = self._raw.get("egress", {})
+        if not isinstance(egress, dict):
+            return 0
+        try:
+            return max(0, min(3, int(egress.get("max_redirects", 3))))
+        except (TypeError, ValueError):
+            return 0
+
     def require_not_api_server(self) -> None:
         """Refuse API server startup in pilot mode."""
         raise PilotPolicyError(

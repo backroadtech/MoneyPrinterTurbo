@@ -14,7 +14,9 @@ from moviepy.video.io.VideoFileClip import VideoFileClip
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
 from app.services import material_cache, task_artifacts, volcengine_seedance
+from app.services.pilot_policy import get_pilot_policy, PilotPolicyError
 from app.utils import utils
+from app.utils.egress import EgressPolicy, safe_download
 
 # Thread-safe counter for API key rotation
 _api_key_counter = 0
@@ -989,6 +991,44 @@ def _save_generated_video_with_retry(
     return ""
 
 
+def _save_video_pilot(video_url: str, save_dir: str, video_path: str) -> str:
+    """
+    BrainTrustCrypto pilot-mode download path.
+
+    Always uses safe egress; no legacy requests fallback. Fails closed on
+    missing/empty allowlist, non-HTTPS, disallowed hosts, unsafe redirects,
+    non-video MIME, oversize, timeouts, and traversal. Partial files are
+    cleaned up by safe_download; atomic rename only after success.
+    """
+    policy = get_pilot_policy()
+    if policy is None:
+        raise PilotPolicyError("pilot policy not loaded")
+
+    allowed_hosts = policy.egress_allowed_hosts
+    if not allowed_hosts:
+        raise PilotPolicyError(
+            "pilot egress allowlist is missing or empty; refusing download"
+        )
+
+    egress_policy = EgressPolicy(
+        allowed_hosts=allowed_hosts,
+        allow_redirects=policy.egress_allow_redirects,
+        max_redirects=policy.egress_max_redirects,
+    )
+
+    # safe_download enforces: HTTPS-only, host allowlist, IP blocklist,
+    # redirect revalidation, video MIME allowlist, 512 MB declared+streamed
+    # limit, connect/read timeouts, partial-file cleanup, atomic rename.
+    # Destination is confined to save_dir (the designated task/material dir).
+    safe_download(
+        video_url,
+        video_path,
+        egress_policy,
+        audit_logger=logger,
+    )
+    return video_path
+
+
 def save_video(video_url: str, save_dir: str = "") -> str:
     if not save_dir:
         save_dir = utils.storage_dir("cache_videos")
@@ -1005,6 +1045,10 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
         logger.info(f"video already exists: {video_path}")
         return video_path
+
+    # BrainTrustCrypto pilot mode: always use safe egress, no fallback.
+    if get_pilot_policy() is not None:
+        return _save_video_pilot(video_url, save_dir, video_path)
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
