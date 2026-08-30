@@ -493,11 +493,40 @@ def search_videos_pexels(
     return []
 
 
+def _require_pilot_provider_allowed(provider_name: str) -> None:
+    """
+    BrainTrustCrypto pilot-mode gate for unapproved material providers.
+
+    When the pilot profile is active, only Pexels is a potentially permitted
+    stock-media provider (and even Pexels requires a separately approved
+    host allowlist and API key). All other providers — Pixabay, Coverr,
+    Wavespeed, and any future additions — must fail closed before any
+    credentials are read, SDKs are initialized, or network requests occur.
+
+    This function is a no-op when pilot mode is not active, preserving
+    existing upstream behavior.
+    """
+    policy = get_pilot_policy()
+    if policy is None:
+        return  # Pilot mode not active — upstream behavior preserved
+
+    raise PilotPolicyError(
+        f"BrainTrustCrypto pilot mode prohibits material provider "
+        f"'{provider_name}'. Only Pexels is potentially permitted, and "
+        f"Pexels requires a separately approved host allowlist and API key. "
+        f"Provider '{provider_name}' must be explicitly approved before use.",
+        policy_path=getattr(policy, 'policy_path', None),
+    )
+
+
 def search_videos_pixabay(
     search_term: str,
     minimum_duration: int,
     video_aspect: VideoAspect = VideoAspect.portrait,
 ) -> List[MaterialInfo]:
+    # BrainTrustCrypto pilot mode: deny Pixabay before any network request.
+    _require_pilot_provider_allowed("pixabay")
+
     aspect = VideoAspect(video_aspect)
 
     video_width, video_height = aspect.to_resolution()
@@ -642,6 +671,9 @@ def search_videos_coverr(
     GET 这个 URL 本身就被 Coverr 当作一次合法的 download 事件计入统计,
     无需再调用 PATCH /videos/:id/stats/downloads。
     """
+    # BrainTrustCrypto pilot mode: deny Coverr before any network request.
+    _require_pilot_provider_allowed("coverr")
+
     aspect = VideoAspect(video_aspect)
     api_key = get_api_key("coverr_api_keys")
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -826,6 +858,10 @@ def generate_videos_wavespeed(
     使其可以直接接入 ``download_videos`` 的通用下载与时长核算流程。
     ``minimum_duration`` 在生成语境下就是目标片段时长（秒）。
     """
+    # BrainTrustCrypto pilot mode: deny Wavespeed before credentials are
+    # read, SDKs are initialized, or network requests occur.
+    _require_pilot_provider_allowed("wavespeed")
+
     aspect = VideoAspect(video_aspect)
     video_width, video_height = aspect.to_resolution()
     api_key = get_api_key("wavespeed_api_keys")
@@ -982,6 +1018,12 @@ def _wait_for_wavespeed_prediction(
     线性退避重试同一个 ID，绝不重新提交任务；状态始终无法确认时抛出
     :class:`WaveSpeedUnconfirmedTaskError`，由调用方终止整个生成流程。
     """
+    # BrainTrustCrypto pilot mode: deny Wavespeed polling before any
+    # network request. This is defense-in-depth — generate_videos_wavespeed
+    # already gates submission, but polling must also fail closed if called
+    # directly or through a future code path.
+    _require_pilot_provider_allowed("wavespeed")
+
     deadline = time.monotonic() + WAVESPEED_RUN_TIMEOUT_SECONDS
     consecutive_failures = 0
     while True:
