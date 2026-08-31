@@ -161,6 +161,31 @@ the last valid state is preserved. All paths are confined to the task
 directory (traversal, unsafe absolute paths, symlink escapes, and junction
 escapes are rejected where testable).
 
+### Chain-head checkpoints
+
+Each chain (`review-events/`, `approvals/`) maintains an atomically updated
+`chain-head.json` checkpoint recording `schema_version`, `chain_type`,
+`last_sequence`, `last_record_id`, `last_record_hash`, and a canonical
+`checkpoint_hash`. The checkpoint is an index, not an immutable review
+event. **Empty-chain rule:** an empty chain has no checkpoint file.
+
+Validation fails closed when the checkpoint is missing on a nonempty chain,
+malformed, hash-invalid, points at a missing or mismatched final record,
+when records exist beyond the checkpoint (an uncommitted tail from an
+interrupted append), or when the checkpoint sequence disagrees with the
+records. Write ordering is: create the immutable record, fsync, then
+atomically update the checkpoint. An interruption between those steps
+leaves an uncommitted tail that fails closed and requires explicit
+low-level recovery (`discard_uncommitted_tail()`), which needs reviewer
+identity and a reason and preserves audit evidence.
+
+**Security limitation.** Chain-head checkpoints detect accidental deletion,
+truncation, corruption, and ordinary manual modification. Without digital
+signatures or an external trusted anchor, a fully capable local attacker
+could roll back both the chain and its checkpoint together. Digital
+signatures and external anchoring are deferred; **no cryptographic
+tamper-proofing is claimed.**
+
 No operator CLI commands (approve/revoke/audit/recover-lock) are exposed
 yet.
 

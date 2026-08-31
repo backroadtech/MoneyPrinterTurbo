@@ -53,6 +53,151 @@ REVIEW_EVENTS_DIR = "review-events"
 APPROVALS_DIR = "approvals"
 REVIEW_LOCK_NAME = "review.lock"
 
+# Chain-head checkpoint filenames (one per chain, inside the chain's dir).
+EVENTS_CHECKPOINT_NAME = "chain-head.json"
+RECEIPTS_CHECKPOINT_NAME = "chain-head.json"
+
+CHAIN_TYPE_REVIEW_EVENTS = "review-events"
+CHAIN_TYPE_APPROVALS = "approvals"
+
+# ---------------------------------------------------------------------------
+# Chain-head checkpoints
+# ---------------------------------------------------------------------------
+# A checkpoint is an atomically maintained index of the current chain head.
+# It is NOT an immutable review event: it is replaced (atomically) on every
+# committed append. It lets validation detect deletion/truncation of the
+# chain tail, which a pure sequence scan cannot see.
+#
+# Empty-chain rule: an empty chain has NO checkpoint file. The presence of
+# any record without a checkpoint, or a checkpoint without its referenced
+# final record, fails closed.
+#
+# Security limitation: checkpoints detect accidental deletion, truncation,
+# corruption, and ordinary manual modification. Without digital signatures
+# or an external trusted anchor, a fully capable local attacker could roll
+# back both the chain and its checkpoint together. Digital signatures and
+# external anchoring are deferred; no cryptographic tamper-proofing is
+# claimed here.
+
+
+def _checkpoint_path(directory: str) -> str:
+    return os.path.join(directory, EVENTS_CHECKPOINT_NAME)
+
+
+def _checkpoint_unsigned_fields(checkpoint: dict) -> dict:
+    return {k: v for k, v in checkpoint.items() if k != "checkpoint_hash"}
+
+
+def _write_checkpoint_atomic(directory: str, checkpoint: dict) -> None:
+    """Atomically replace the chain-head checkpoint (temp + fsync + rename)."""
+    payload = _canonical_bytes(checkpoint) + b"\n"
+    path = _checkpoint_path(directory)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".part", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _build_checkpoint(
+    *, chain_type: str, sequence: int, record_id: str, record_hash: str
+) -> dict:
+    checkpoint = {
+        "schema_version": SCHEMA_VERSION,
+        "chain_type": chain_type,
+        "last_sequence": sequence,
+        "last_record_id": record_id,
+        "last_record_hash": record_hash,
+    }
+    checkpoint["checkpoint_hash"] = _canonical_hash(
+        _checkpoint_unsigned_fields(checkpoint)
+    )
+    return checkpoint
+
+
+def _read_checkpoint(directory: str) -> dict | None:
+    path = _checkpoint_path(directory)
+    if not os.path.exists(path):
+        return None
+    return _read_json_file(path, "chain-head checkpoint")
+
+
+def _validate_checkpoint(
+    directory: str,
+    chain_type: str,
+    entries: list[tuple[int, str]],
+    records: list[dict],
+    id_field: str,
+    hash_field: str,
+) -> None:
+    """Fail closed on any checkpoint/chain disagreement.
+
+    Detects: missing checkpoint on a nonempty chain, malformed checkpoint,
+    invalid checkpoint hash, missing final record, final-record hash
+    mismatch, records beyond the checkpoint, and sequence disagreement.
+    """
+    checkpoint = _read_checkpoint(directory)
+    if not entries:
+        # Empty chain: no checkpoint is the only valid state.
+        if checkpoint is not None:
+            raise ReviewIntegrityError(
+                f"{chain_type} checkpoint exists but the chain is empty"
+            )
+        return
+    if checkpoint is None:
+        raise ReviewIntegrityError(
+            f"{chain_type} chain is nonempty but the chain-head checkpoint "
+            "is missing"
+        )
+
+    for field in ("schema_version", "chain_type", "last_sequence",
+                  "last_record_id", "last_record_hash", "checkpoint_hash"):
+        if field not in checkpoint:
+            raise ReviewIntegrityError(
+                f"{chain_type} checkpoint missing field: {field}"
+            )
+    if checkpoint["schema_version"] != SCHEMA_VERSION:
+        raise ReviewIntegrityError(
+            f"{chain_type} checkpoint has unsupported schema_version: "
+            f"{checkpoint['schema_version']!r}"
+        )
+    if checkpoint["chain_type"] != chain_type:
+        raise ReviewIntegrityError(
+            f"{chain_type} checkpoint chain_type mismatch: "
+            f"{checkpoint['chain_type']!r}"
+        )
+    recomputed = _canonical_hash(_checkpoint_unsigned_fields(checkpoint))
+    if recomputed != checkpoint["checkpoint_hash"]:
+        raise ReviewIntegrityError(
+            f"{chain_type} checkpoint modified: checkpoint_hash mismatch"
+        )
+
+    last_seq, last_name = entries[-1]
+    last_record = records[-1]
+    if checkpoint["last_sequence"] != last_seq:
+        raise ReviewIntegrityError(
+            f"{chain_type} checkpoint sequence {checkpoint['last_sequence']} "
+            f"disagrees with records (last sequence {last_seq})"
+        )
+    if checkpoint["last_record_id"] != last_record[id_field]:
+        raise ReviewIntegrityError(
+            f"{chain_type} checkpoint last_record_id does not match the "
+            "final record"
+        )
+    if checkpoint["last_record_hash"] != last_record[hash_field]:
+        raise ReviewIntegrityError(
+            f"{chain_type} checkpoint last_record_hash does not match the "
+            "final record"
+        )
+
 # ---------------------------------------------------------------------------
 # Event types (closed set)
 # ---------------------------------------------------------------------------
@@ -392,6 +537,17 @@ def create_review_event(
     path = _confined_file_path(task_dir, REVIEW_EVENTS_DIR, filename)
     _atomic_create_exclusive(path, _canonical_bytes(event) + b"\n")
 
+    # Write ordering: the immutable event exists before the checkpoint. If
+    # interruption occurs here, the event is an uncommitted tail that fails
+    # closed on the next validation and requires explicit recovery.
+    checkpoint = _build_checkpoint(
+        chain_type=CHAIN_TYPE_REVIEW_EVENTS,
+        sequence=sequence,
+        record_id=event_id,
+        record_hash=event["event_hash"],
+    )
+    _write_checkpoint_atomic(directory, checkpoint)
+
     # Fail closed if the append did not produce a valid chain.
     validate_review_event_chain(task_dir)
     return event
@@ -467,6 +623,13 @@ def validate_review_event_chain(task_dir: str) -> list[dict]:
         previous_hash = event["event_hash"]
         events.append(event)
 
+    # Chain-head checkpoint validation: detects deletion/truncation of the
+    # tail, missing/malformed/modified checkpoint, and records beyond the
+    # checkpoint (uncommitted tail). Fails closed on any disagreement.
+    _validate_checkpoint(
+        directory, CHAIN_TYPE_REVIEW_EVENTS, entries, events,
+        id_field="event_id", hash_field="event_hash",
+    )
     return events
 
 
@@ -614,6 +777,17 @@ def create_receipt(
     path = _confined_file_path(task_dir, APPROVALS_DIR, filename)
     _atomic_create_exclusive(path, _canonical_bytes(receipt) + b"\n")
 
+    # Write ordering: the immutable receipt exists before the checkpoint. An
+    # interruption here leaves an uncommitted tail that fails closed on the
+    # next validation and requires explicit recovery.
+    checkpoint = _build_checkpoint(
+        chain_type=CHAIN_TYPE_APPROVALS,
+        sequence=sequence,
+        record_id=receipt_id,
+        record_hash=receipt["receipt_hash"],
+    )
+    _write_checkpoint_atomic(directory, checkpoint)
+
     # Fail closed if the append did not produce a valid chain.
     validate_receipt_chain(task_dir)
     return receipt
@@ -735,6 +909,11 @@ def validate_receipt_chain(task_dir: str) -> list[dict]:
         previous_hash = receipt["receipt_hash"]
         receipts.append(receipt)
 
+    # Chain-head checkpoint validation (same fail-closed rules as events).
+    _validate_checkpoint(
+        directory, CHAIN_TYPE_APPROVALS, entries, receipts,
+        id_field="receipt_id", hash_field="receipt_hash",
+    )
     return receipts
 
 
@@ -742,6 +921,125 @@ def receipt_chain_head_hash(task_dir: str) -> str:
     """Return the receipt_hash of the chain head (genesis hash when empty)."""
     receipts = validate_receipt_chain(task_dir)
     return receipts[-1]["receipt_hash"] if receipts else _GENESIS_HASH
+
+
+# ---------------------------------------------------------------------------
+# Uncommitted-tail recovery (explicit, low-level; no CLI command yet)
+# ---------------------------------------------------------------------------
+
+
+def find_uncommitted_tail(task_dir: str, chain_type: str) -> list[tuple[int, str]]:
+    """Return (sequence, filename) records beyond the committed checkpoint.
+
+    These are records that were created but whose checkpoint update did not
+    complete (interrupted append). They are NOT silently accepted or
+    deleted; an explicit recovery decision is required.
+    """
+    if chain_type == CHAIN_TYPE_REVIEW_EVENTS:
+        directory = _sub_dir(task_dir, REVIEW_EVENTS_DIR, create=False)
+    elif chain_type == CHAIN_TYPE_APPROVALS:
+        directory = _sub_dir(task_dir, APPROVALS_DIR, create=False)
+    else:
+        raise ReviewIntegrityError(f"unknown chain_type: {chain_type!r}")
+    entries = _scan_sequence(directory)
+    checkpoint = _read_checkpoint(directory)
+    committed_seq = checkpoint["last_sequence"] if checkpoint else 0
+    return [(seq, name) for seq, name in entries if seq > committed_seq]
+
+
+def discard_uncommitted_tail(
+    task_dir: str,
+    *,
+    chain_type: str,
+    reviewer_id: str,
+    reviewer_display_name: str,
+    reason: str,
+    timestamp_utc: str,
+) -> dict:
+    """Explicitly discard uncommitted tail records after an interrupted append.
+
+    Requires reviewer identity and a reason. Removes only records beyond the
+    committed checkpoint, then records a LOCK_RECOVERED-style audit event in
+    the review-event chain (when discarding from the receipt chain) so the
+    recovery itself leaves audit evidence. Never touches committed records.
+
+    Note: discarding from the review-events chain rewrites that chain's
+    checkpoint to the last committed record; discarding from the receipt
+    chain appends an audit event to the review-events chain.
+    """
+    _validate_reviewer(reviewer_id, reviewer_display_name)
+    if not isinstance(reason, str) or not reason.strip():
+        raise ReviewIntegrityError("tail recovery requires a non-empty reason")
+    _validate_timestamp(timestamp_utc, "recovery timestamp_utc")
+
+    tail = find_uncommitted_tail(task_dir, chain_type)
+    if not tail:
+        raise ReviewIntegrityError(
+            f"no uncommitted tail in the {chain_type} chain to recover"
+        )
+
+    if chain_type == CHAIN_TYPE_REVIEW_EVENTS:
+        directory = _sub_dir(task_dir, REVIEW_EVENTS_DIR, create=False)
+    else:
+        directory = _sub_dir(task_dir, APPROVALS_DIR, create=False)
+
+    discarded = []
+    for seq, name in tail:
+        record = _read_json_file(os.path.join(directory, name), "tail record")
+        discarded.append(record)
+        try:
+            os.unlink(os.path.join(directory, name))
+        except OSError as exc:
+            raise ReviewIntegrityError(
+                f"failed to remove uncommitted tail record {name}"
+            ) from exc
+
+    # Audit evidence of the recovery. When recovering the receipt chain we
+    # can append a review event; when recovering the event chain itself we
+    # cannot (its checkpoint is stale), so we rebuild its checkpoint to the
+    # last committed record and report via the return value.
+    audit_event = None
+    if chain_type == CHAIN_TYPE_APPROVALS:
+        audit_event = create_review_event(
+            task_dir,
+            event_type="LOCK_RECOVERED",
+            reviewer_id=reviewer_id,
+            reviewer_display_name=reviewer_display_name,
+            timestamp_utc=timestamp_utc,
+            reason=f"discarded uncommitted receipt-chain tail: {reason}",
+            details={
+                "recovered_chain": chain_type,
+                "discarded_count": len(discarded),
+                "discarded_ids": [
+                    r.get("receipt_id") for r in discarded
+                ],
+            },
+        )
+    else:
+        # Rebuild the event-chain checkpoint to the committed head.
+        events_dir = _sub_dir(task_dir, REVIEW_EVENTS_DIR, create=False)
+        remaining = _scan_sequence(events_dir)
+        checkpoint = _read_checkpoint(events_dir)
+        committed_seq = checkpoint["last_sequence"] if checkpoint else 0
+        committed = [(s, n) for s, n in remaining if s <= committed_seq]
+        if committed:
+            last_seq, last_name = committed[-1]
+            last_record = _read_json_file(
+                os.path.join(events_dir, last_name), "review event"
+            )
+            new_checkpoint = _build_checkpoint(
+                chain_type=CHAIN_TYPE_REVIEW_EVENTS,
+                sequence=last_seq,
+                record_id=last_record["event_id"],
+                record_hash=last_record["event_hash"],
+            )
+            _write_checkpoint_atomic(events_dir, new_checkpoint)
+
+    return {
+        "chain_type": chain_type,
+        "discarded": discarded,
+        "audit_event": audit_event,
+    }
 
 
 # ---------------------------------------------------------------------------

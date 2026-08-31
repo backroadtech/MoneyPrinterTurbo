@@ -399,6 +399,16 @@ class TestReviewEvents(_TaskDirBase):
         with self.assertRaises(ri.ReviewIntegrityError):
             ri.validate_review_event_chain(self.task_dir)
 
+    def test_missing_final_event_detected(self):
+        self._event()
+        e2 = self._event(timestamp_utc=UTC2)
+        # Delete the TAIL event. The checkpoint still points at it, so
+        # validation must fail closed even though the sequence is contiguous.
+        os.unlink(os.path.join(self.task_dir, "review-events",
+                               f"000002_{e2['event_id']}.json"))
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.validate_review_event_chain(self.task_dir)
+
     def test_reordered_event_detected(self):
         self._event()
         e2 = self._event(timestamp_utc=UTC2)
@@ -767,6 +777,270 @@ class TestReviewLock(_TaskDirBase):
             ri.validate_review_event_chain(self.task_dir)[0]["event_type"],
             "LOCK_RECOVERED",
         )
+
+
+# ---------------------------------------------------------------------------
+# Chain-head checkpoints
+# ---------------------------------------------------------------------------
+
+
+class TestChainHeadCheckpoint(_TaskDirBase):
+    def _event(self, **overrides):
+        kwargs = dict(
+            event_type="CLAIM_VERIFIED",
+            reviewer_id=REVIEWER_ID,
+            reviewer_display_name=REVIEWER_NAME,
+            timestamp_utc=UTC,
+            manifest_hash_before=HASH_A,
+            manifest_hash_after=HASH_B,
+        )
+        kwargs.update(overrides)
+        return ri.create_review_event(self.task_dir, **kwargs)
+
+    def _approval(self, **overrides):
+        kwargs = dict(
+            receipt_type="APPROVAL",
+            task_id="task-001",
+            manifest_version="1.1.0",
+            manifest_relative_path="provenance_manifest.json",
+            manifest_sha256=HASH_A,
+            audit_head_hash=HASH_B,
+            created_at_utc=UTC,
+            reviewer_id=REVIEWER_ID,
+            reviewer_display_name=REVIEWER_NAME,
+        )
+        kwargs.update(overrides)
+        return ri.create_receipt(self.task_dir, **kwargs)
+
+    def _events_dir(self):
+        return os.path.join(self.task_dir, "review-events")
+
+    def _approvals_dir(self):
+        return os.path.join(self.task_dir, "approvals")
+
+    def _checkpoint_path(self, chain_dir):
+        return os.path.join(chain_dir, "chain-head.json")
+
+    # -- checkpoint structure ------------------------------------------------
+
+    def test_checkpoint_created_and_canonical(self):
+        event = self._event()
+        cp = json.loads(open(self._checkpoint_path(self._events_dir()),
+                             encoding="utf-8").read())
+        for field in ("schema_version", "chain_type", "last_sequence",
+                      "last_record_id", "last_record_hash", "checkpoint_hash"):
+            self.assertIn(field, cp)
+        self.assertEqual(cp["chain_type"], "review-events")
+        self.assertEqual(cp["last_sequence"], 1)
+        self.assertEqual(cp["last_record_id"], event["event_id"])
+        self.assertEqual(cp["last_record_hash"], event["event_hash"])
+        # checkpoint_hash is canonical over the unsigned fields.
+        unsigned = {k: v for k, v in cp.items() if k != "checkpoint_hash"}
+        self.assertEqual(cp["checkpoint_hash"], prov.canonical_sha256(unsigned))
+
+    def test_checkpoint_advances_with_each_append(self):
+        e1 = self._event()
+        e2 = self._event(timestamp_utc=UTC2)
+        cp = json.loads(open(self._checkpoint_path(self._events_dir()),
+                             encoding="utf-8").read())
+        self.assertEqual(cp["last_sequence"], 2)
+        self.assertEqual(cp["last_record_id"], e2["event_id"])
+
+    def test_empty_chain_has_no_checkpoint(self):
+        # Chosen rule: an empty chain has NO checkpoint file.
+        self.assertEqual(ri.validate_review_event_chain(self.task_dir), [])
+        self.assertFalse(os.path.exists(self._checkpoint_path(self._events_dir())))
+
+    # -- event-chain checkpoint defects --------------------------------------
+
+    def test_deleted_checkpoint_detected(self):
+        self._event()
+        os.unlink(self._checkpoint_path(self._events_dir()))
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.validate_review_event_chain(self.task_dir)
+
+    def test_malformed_checkpoint_detected(self):
+        self._event()
+        with open(self._checkpoint_path(self._events_dir()), "w") as h:
+            h.write("{corrupt")
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.validate_review_event_chain(self.task_dir)
+
+    def test_modified_checkpoint_detected(self):
+        self._event()
+        path = self._checkpoint_path(self._events_dir())
+        cp = json.loads(open(path, encoding="utf-8").read())
+        cp["last_sequence"] = 99
+        with open(path, "w", encoding="utf-8") as h:
+            json.dump(cp, h)
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.validate_review_event_chain(self.task_dir)
+
+    def test_checkpoint_pointing_to_earlier_record_detected(self):
+        e1 = self._event()
+        self._event(timestamp_utc=UTC2)
+        # Rewrite the checkpoint to point back at e1 (roll back the head).
+        path = self._checkpoint_path(self._events_dir())
+        rolled = ri._build_checkpoint(
+            chain_type="review-events", sequence=1,
+            record_id=e1["event_id"], record_hash=e1["event_hash"],
+        )
+        with open(path, "w", encoding="utf-8") as h:
+            h.write(json.dumps(rolled))
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.validate_review_event_chain(self.task_dir)
+
+    def test_extra_record_beyond_checkpoint_detected(self):
+        e1 = self._event()
+        # Manually add a second event file WITHOUT updating the checkpoint.
+        e2 = {
+            "schema_version": "1.1.0", "sequence": 2, "event_id": "f" * 32,
+            "event_type": "CLAIM_VERIFIED", "timestamp_utc": UTC2,
+            "reviewer_id": REVIEWER_ID, "reviewer_display_name": REVIEWER_NAME,
+            "reason": None, "previous_event_hash": e1["event_hash"],
+            "manifest_hash_before": HASH_A, "manifest_hash_after": HASH_B,
+            "details": None,
+        }
+        e2["event_hash"] = prov.canonical_sha256(
+            {k: v for k, v in e2.items() if k != "event_hash"}
+        )
+        path = os.path.join(self._events_dir(), f"000002_{e2['event_id']}.json")
+        with open(path, "w", encoding="utf-8") as h:
+            h.write(prov.canonical_json_bytes(e2).decode("utf-8") + "\n")
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.validate_review_event_chain(self.task_dir)
+
+    # -- receipt-chain checkpoint defects ------------------------------------
+
+    def test_receipt_checkpoint_created(self):
+        receipt = self._approval()
+        cp = json.loads(open(self._checkpoint_path(self._approvals_dir()),
+                             encoding="utf-8").read())
+        self.assertEqual(cp["chain_type"], "approvals")
+        self.assertEqual(cp["last_record_id"], receipt["receipt_id"])
+        self.assertEqual(cp["last_record_hash"], receipt["receipt_hash"])
+
+    def test_deleted_final_receipt_detected(self):
+        self._approval()
+        r2 = self._approval(created_at_utc=UTC2)
+        os.unlink(os.path.join(self._approvals_dir(),
+                               f"000002_{r2['receipt_id']}.json"))
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.validate_receipt_chain(self.task_dir)
+
+    def test_deleted_receipt_checkpoint_detected(self):
+        self._approval()
+        os.unlink(self._checkpoint_path(self._approvals_dir()))
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.validate_receipt_chain(self.task_dir)
+
+    def test_modified_receipt_checkpoint_detected(self):
+        self._approval()
+        path = self._checkpoint_path(self._approvals_dir())
+        cp = json.loads(open(path, encoding="utf-8").read())
+        cp["last_record_hash"] = "0" * 64
+        with open(path, "w", encoding="utf-8") as h:
+            json.dump(cp, h)
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.validate_receipt_chain(self.task_dir)
+
+    # -- crash recovery: uncommitted tail ------------------------------------
+
+    def test_crash_after_record_before_checkpoint_fails_closed(self):
+        self._event()
+        # Simulate a crash: create event 2's file but never update checkpoint.
+        original_write_cp = ri._write_checkpoint_atomic
+        ri._write_checkpoint_atomic = lambda *a, **k: (_ for _ in ()).throw(
+            OSError("simulated crash before checkpoint")
+        )
+        try:
+            with self.assertRaises(OSError):
+                self._event(timestamp_utc=UTC2)
+        finally:
+            ri._write_checkpoint_atomic = original_write_cp
+        # The uncommitted tail record exists on disk.
+        tail = ri.find_uncommitted_tail(self.task_dir, "review-events")
+        self.assertEqual(len(tail), 1)
+        self.assertEqual(tail[0][0], 2)
+        # Validation fails closed: record exists beyond the checkpoint.
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.validate_review_event_chain(self.task_dir)
+
+    def test_explicit_recovery_of_uncommitted_event_tail(self):
+        self._event()
+        original_write_cp = ri._write_checkpoint_atomic
+        ri._write_checkpoint_atomic = lambda *a, **k: (_ for _ in ()).throw(
+            OSError("crash")
+        )
+        try:
+            with self.assertRaises(OSError):
+                self._event(timestamp_utc=UTC2)
+        finally:
+            ri._write_checkpoint_atomic = original_write_cp
+        # Explicit recovery discards the uncommitted tail.
+        result = ri.discard_uncommitted_tail(
+            self.task_dir, chain_type="review-events",
+            reviewer_id="admin.reviewer", reviewer_display_name="Admin",
+            reason="interrupted append", timestamp_utc=UTC3,
+        )
+        self.assertEqual(len(result["discarded"]), 1)
+        # Chain is valid again and back to one committed event.
+        events = ri.validate_review_event_chain(self.task_dir)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(ri.find_uncommitted_tail(self.task_dir, "review-events"),
+                         [])
+
+    def test_explicit_recovery_of_uncommitted_receipt_tail(self):
+        self._approval()
+        original_write_cp = ri._write_checkpoint_atomic
+        ri._write_checkpoint_atomic = lambda *a, **k: (_ for _ in ()).throw(
+            OSError("crash")
+        )
+        try:
+            with self.assertRaises(OSError):
+                self._approval(created_at_utc=UTC2)
+        finally:
+            ri._write_checkpoint_atomic = original_write_cp
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.validate_receipt_chain(self.task_dir)
+        result = ri.discard_uncommitted_tail(
+            self.task_dir, chain_type="approvals",
+            reviewer_id="admin.reviewer", reviewer_display_name="Admin",
+            reason="interrupted receipt append", timestamp_utc=UTC3,
+        )
+        self.assertEqual(len(result["discarded"]), 1)
+        # Receipt chain valid again; recovery left an audit event.
+        self.assertEqual(len(ri.validate_receipt_chain(self.task_dir)), 1)
+        self.assertIsNotNone(result["audit_event"])
+        events = ri.validate_review_event_chain(self.task_dir)
+        self.assertEqual(events[-1]["event_type"], "LOCK_RECOVERED")
+
+    def test_recovery_requires_reason(self):
+        self._event()
+        original_write_cp = ri._write_checkpoint_atomic
+        ri._write_checkpoint_atomic = lambda *a, **k: (_ for _ in ()).throw(
+            OSError("crash")
+        )
+        try:
+            with self.assertRaises(OSError):
+                self._event(timestamp_utc=UTC2)
+        finally:
+            ri._write_checkpoint_atomic = original_write_cp
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.discard_uncommitted_tail(
+                self.task_dir, chain_type="review-events",
+                reviewer_id="admin.reviewer", reviewer_display_name="Admin",
+                reason="", timestamp_utc=UTC3,
+            )
+
+    def test_recovery_without_tail_fails(self):
+        self._event()
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.discard_uncommitted_tail(
+                self.task_dir, chain_type="review-events",
+                reviewer_id="admin.reviewer", reviewer_display_name="Admin",
+                reason="nothing to do", timestamp_utc=UTC3,
+            )
 
 
 # ---------------------------------------------------------------------------
