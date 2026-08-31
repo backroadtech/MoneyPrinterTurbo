@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://braintrustcrypto.local/schemas/provenance-manifest.schema.json",
+  "title": "BrainTrustCrypto Provenance Manifest",
+  "description": "Offline provenance and human-review manifest (Phase 1B.3A). Every manifest defaults to NEEDS_HUMAN_REVIEW. Secrets, credentials, and full sensitive prompts are never recorded; only prompt hashes are stored.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task", "script", "assets", "factual_claims", "ai_generations", "output"],
+  "properties": {
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "task_id", "created_at", "topic", "pilot_profile", "review_status"],
+      "properties": {
+        "schema_version": { "type": "string", "const": "1.0.0" },
+        "task_id": { "type": "string", "minLength": 1 },
+        "created_at": { "type": "string", "format": "date-time", "description": "UTC ISO-8601 timestamp" },
+        "topic": { "type": "string", "minLength": 1 },
+        "pilot_profile": { "type": "string", "minLength": 1 },
+        "review_status": { "type": "string", "enum": ["NEEDS_HUMAN_REVIEW", "APPROVED", "REJECTED"], "default": "NEEDS_HUMAN_REVIEW" }
+      }
+    },
+    "script": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["local_path", "sha256", "generation_source", "ai_provider", "ai_model", "prompt_hash"],
+      "properties": {
+        "local_path": { "type": "string", "description": "Path relative to the task directory" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "generation_source": { "type": "string", "minLength": 1 },
+        "ai_provider": { "type": ["string", "null"] },
+        "ai_model": { "type": ["string", "null"] },
+        "prompt_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the prompt only; the full sensitive prompt is never stored" }
+      }
+    },
+    "assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["asset_type", "source_type", "source_url", "provider", "provider_asset_id", "retrieval_date", "local_path", "sha256", "license_name", "license_evidence", "notes"],
+        "properties": {
+          "asset_type": { "type": "string", "enum": ["video", "audio", "image", "text", "subtitle", "other"] },
+          "source_type": { "type": "string", "enum": ["local", "provider", "ai_generated"] },
+          "source_url": { "type": ["string", "null"], "description": "Required for provider assets; optional for local/ai_generated" },
+          "provider": { "type": ["string", "null"], "description": "Required for provider and ai_generated assets" },
+          "provider_asset_id": { "type": ["string", "null"], "description": "Required for provider assets" },
+          "retrieval_date": { "type": ["string", "null"], "format": "date-time", "description": "Required for provider assets" },
+          "local_path": { "type": "string" },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "license_name": { "type": "string", "minLength": 1 },
+          "license_evidence": { "type": "string", "minLength": 1, "description": "License evidence/reference; required for every asset including local" },
+          "notes": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "factual_claims": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["claim_text", "source_url", "source_publication_date", "retrieval_date", "status", "reviewer", "review_date"],
+        "properties": {
+          "claim_text": { "type": "string", "minLength": 1 },
+          "source_url": { "type": "string", "minLength": 1 },
+          "source_publication_date": { "type": ["string", "null"] },
+          "retrieval_date": { "type": ["string", "null"], "format": "date-time" },
+          "status": { "type": "string", "enum": ["UNVERIFIED", "VERIFIED", "RETRACTED"], "default": "UNVERIFIED" },
+          "reviewer": { "type": ["string", "null"], "description": "Required when status is VERIFIED or RETRACTED" },
+          "review_date": { "type": ["string", "null"], "format": "date-time", "description": "Required when status is VERIFIED or RETRACTED" }
+        }
+      }
+    },
+    "ai_generations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["provider", "model", "generation_timestamp", "output_type", "prompt_hash", "parameters"],
+        "properties": {
+          "provider": { "type": "string", "minLength": 1 },
+          "model": { "type": "string", "minLength": 1 },
+          "generation_timestamp": { "type": "string", "format": "date-time" },
+          "output_type": { "type": "string", "enum": ["text", "image", "audio", "video", "script", "other"] },
+          "prompt_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "parameters": { "type": "object", "description": "Non-secret generation parameters only; credential-like keys are rejected" }
+        }
+      }
+    },
+    "output": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["local_path", "sha256", "review_status", "filename_marker", "visible_watermark_required"],
+      "properties": {
+        "local_path": { "type": "string" },
+        "sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+        "review_status": { "type": "string", "enum": ["NEEDS_HUMAN_REVIEW", "APPROVED", "REJECTED"], "default": "NEEDS_HUMAN_REVIEW" },
+        "filename_marker": { "type": "string", "description": "Filename carrying the __NEEDS_HUMAN_REVIEW marker while unreviewed" },
+        "visible_watermark_required": { "type": "boolean", "const": false }
+      }
+    }
+  }
+}
