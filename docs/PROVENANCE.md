@@ -1,11 +1,12 @@
-# Provenance Manifest — Phase 1B.3A
+# Provenance Manifest — Phase 1B.3A / 1B.3C.2A
 
 Offline provenance and human-review manifest foundation for BrainTrustCrypto
 pilot tasks.
 
-**Status:** foundation only. This module is **not** integrated with rendering,
-providers, CLI, TTS, LLM, or publishing. Integration is deferred to Phase
-1B.3B.
+**Status:** foundation plus offline review-integrity primitives (schema
+1.1.0). This module is **not** integrated with rendering, providers,
+publishing, or review CLI commands. CLI integration is deferred to a later
+phase.
 
 ## Purpose
 
@@ -26,7 +27,7 @@ Machine-readable schema: `docs/provenance-manifest-schema.json`
 ### 1. Task
 | Field | Notes |
 |---|---|
-| `schema_version` | Currently `"1.0.0"` |
+| `schema_version` | `"1.1.0"` for new manifests; `"1.0.0"` manifests remain valid for read/validate and explicit migration only |
 | `task_id` | Non-empty string |
 | `created_at` | UTC ISO-8601 timestamp (offset required) |
 | `topic` | Non-empty string |
@@ -57,8 +58,27 @@ Rules enforced by `build_asset()`:
 `retrieval_date`, and `status`: `UNVERIFIED` (default), `VERIFIED`, or
 `RETRACTED`.
 
-A `VERIFIED` or `RETRACTED` claim **must** name a `reviewer` and a
-`review_date` — a human decision without accountability is rejected.
+Accountability (schema 1.0.0 legacy path): a `VERIFIED` or `RETRACTED` claim
+must name a `reviewer` and a `review_date`.
+
+Schema 1.1.0 adds optional fields: `supporting_sources` (list of URLs),
+`reviewer_id`, `reviewer_display_name`, `review_timestamp_utc`, and `notes`.
+
+Reviewer identity rules (1.1.0):
+- `reviewer_id` — lowercase only, 1–64 characters,
+  `[a-z0-9][a-z0-9._-]{0,63}`.
+- `reviewer_display_name` — 1–128 characters, control characters rejected.
+  Manually supplied during the pilot; no authentication or credentials yet.
+
+Supporting-source rules (1.1.0):
+- A `VERIFIED` claim requires **at least one valid supporting HTTPS URL**.
+  The existing `source_url` may satisfy this; `supporting_sources` entries
+  are optional extras.
+- A `RETRACTED` claim using the 1.1.0 identity fields requires
+  `reviewer_id`, `reviewer_display_name`, `review_timestamp_utc`, and
+  explanatory `notes`.
+- Active `UNVERIFIED` and `RETRACTED` claims **block task approval**
+  (`assert_no_blocking_claims()`).
 
 ### 5. AI generations
 `provider`, `model`, `generation_timestamp` (UTC), `output_type`
@@ -71,11 +91,78 @@ private keys) or full prompts are rejected.
 `local_path`, `sha256` (when the file exists), `review_status`,
 `filename_marker`, and `visible_watermark_required` (always `false`).
 
+Schema 1.1.0 output `review_status` values: `NEEDS_HUMAN_REVIEW`,
+`APPROVED`, `REJECTED`, `SUPERSEDED`. **`REVOKED` is intentionally not a
+value** — revocation is recorded via an immutable receipt, never by
+mutating `output.review_status`.
+
 While unreviewed, the output filename carries the marker
 `__NEEDS_HUMAN_REVIEW` before its extension
 (`final__NEEDS_HUMAN_REVIEW.mp4`). The marker is removed on a terminal
 human decision. **No visible watermark is required** — the marker lives in
 the filename only.
+
+## Schema 1.1.0 and migration
+
+- New manifests are built with `schema_version = "1.1.0"`.
+- Existing `1.0.0` manifests remain valid: `validate_manifest()` accepts
+  both versions and applies the legacy rules to 1.0.0 documents.
+- `migrate_manifest_1_0_0_to_1_1_0()` performs an **explicit, additive-only**
+  migration: it validates the 1.0.0 manifest, deep-copies it, sets
+  `schema_version` to `1.1.0`, initializes the new claim fields to `null`,
+  and re-validates. A 1.0.0 manifest is **never silently reinterpreted or
+  overwritten in place** — the input dict is not mutated.
+
+## Canonical JSON for hashes
+
+Audit events, receipts, and manifest snapshots are hashed over canonical
+UTF-8 JSON bytes with these exact rules:
+
+- `sort_keys=True`
+- `separators=(",", ":")` (compact)
+- `ensure_ascii=False`
+- `allow_nan=False`
+- no trailing whitespace; the hashed bytes have **no trailing newline**
+- **floating-point values are rejected** in any structure that is hashed
+  (cross-platform float serialization would break hash stability)
+
+`provenance.canonical_json_bytes()` and `provenance.canonical_sha256()`
+implement these rules; serialization is deterministic across repeated calls.
+
+## Review-integrity primitives (Phase 1B.3C.2A)
+
+`app/services/review_integrity.py` — standard library only, fully offline.
+Standalone primitives confined to the task directory:
+
+- `manifest-history/000001_<manifest-sha256>.json` — immutable manifest
+  snapshots; never overwritten; verified against the hash in the filename.
+- `review-events/000001_<event-id>.json` — sequential, hash-chained audit
+  events. Each event carries `schema_version`, `sequence`, `event_id`,
+  `event_type`, `timestamp_utc`, `reviewer_id`, `reviewer_display_name`,
+  `reason` (when required), `previous_event_hash`, `manifest_hash_before`,
+  `manifest_hash_after`, `details`, and `event_hash`. The chain fails closed
+  on missing, reordered, duplicated, malformed, or modified events.
+- `approvals/000001_<receipt-id>.json` — sequential, hash-chained
+  APPROVAL/REVOCATION receipts. A REVOCATION must reference the
+  `receipt_id` and `receipt_hash` of the APPROVAL it revokes; double
+  revocation is rejected. Receipts are canonical, immutable, atomically
+  created, and never overwritten.
+- `review.lock` — task-local exclusive lock (`lock_token`, `process_id`,
+  `hostname`, `created_at_utc`, reviewer identity). Acquisition fails closed
+  when a lock exists or is malformed; release requires the matching token;
+  **age alone is never treated as abandonment**. Explicit recovery
+  (`recover_review_lock()`) requires reviewer identity and a reason, removes
+  the lock, and records a `LOCK_RECOVERED` audit event — including whether
+  the original lock was malformed (captured **before** removal).
+
+All creation is atomic: same-directory temporary file, flush + fsync, then
+exclusive finalization; temporary files are cleaned up after failure, and
+the last valid state is preserved. All paths are confined to the task
+directory (traversal, unsafe absolute paths, symlink escapes, and junction
+escapes are rejected where testable).
+
+No operator CLI commands (approve/revoke/audit/recover-lock) are exposed
+yet.
 
 ## Review states and transitions
 
@@ -86,7 +173,8 @@ NEEDS_HUMAN_REVIEW ──► APPROVED   (terminal)
 
 - Every new manifest defaults to `NEEDS_HUMAN_REVIEW`.
 - `APPROVED` and `REJECTED` are terminal; no further transitions.
-- Approving is rejected while any factual claim remains `UNVERIFIED`.
+- Approving is rejected while any factual claim remains `UNVERIFIED`
+  (schema 1.1.0: `UNVERIFIED` or `RETRACTED`).
 - Any transition not listed above is rejected
   (`transition_review_status()`).
 

@@ -33,7 +33,9 @@ import re
 import tempfile
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
+SCHEMA_VERSION_1_0_0 = "1.0.0"
+SUPPORTED_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION, SCHEMA_VERSION_1_0_0})
 
 # ---------------------------------------------------------------------------
 # Enums (closed sets)
@@ -44,6 +46,20 @@ ASSET_TYPES = frozenset({"video", "audio", "image", "text", "subtitle", "other"}
 SOURCE_TYPES = frozenset({"local", "provider", "ai_generated"})
 CLAIM_STATUSES = frozenset({"UNVERIFIED", "VERIFIED", "RETRACTED"})
 OUTPUT_TYPES = frozenset({"text", "image", "audio", "video", "script", "other"})
+
+# Schema 1.1.0: review lifecycle states for the output section. REVOKED is
+# intentionally NOT included here; revocation is recorded via receipt, not
+# by mutating output.review_status.
+OUTPUT_REVIEW_STATUSES = frozenset(
+    {"NEEDS_HUMAN_REVIEW", "APPROVED", "REJECTED", "SUPERSEDED"}
+)
+
+# Reviewer identity rules (schema 1.1.0).
+REVIEWER_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+REVIEWER_ID_MIN = 1
+REVIEWER_ID_MAX = 64
+REVIEWER_DISPLAY_NAME_MIN = 1
+REVIEWER_DISPLAY_NAME_MAX = 128
 
 DEFAULT_REVIEW_STATUS = "NEEDS_HUMAN_REVIEW"
 NEEDS_HUMAN_REVIEW_MARKER = "__NEEDS_HUMAN_REVIEW"
@@ -298,6 +314,149 @@ def _validate_prompt_hash(value, field: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Reviewer identity (schema 1.1.0)
+# ---------------------------------------------------------------------------
+
+
+def validate_reviewer_id(value) -> str:
+    """Validate a reviewer_id: lowercase, 1-64 chars, [a-z0-9][a-z0-9._-]{0,63}."""
+    if not isinstance(value, str):
+        raise ProvenanceError("reviewer_id must be a string")
+    if not (REVIEWER_ID_MIN <= len(value) <= REVIEWER_ID_MAX):
+        raise ProvenanceError(
+            f"reviewer_id must be {REVIEWER_ID_MIN}-{REVIEWER_ID_MAX} characters"
+        )
+    if not REVIEWER_ID_PATTERN.fullmatch(value):
+        raise ProvenanceError(
+            "reviewer_id must match [a-z0-9][a-z0-9._-]{0,63} (lowercase only)"
+        )
+    return value
+
+
+def validate_reviewer_display_name(value) -> str:
+    """Validate a reviewer_display_name: 1-128 chars, no control characters."""
+    if not isinstance(value, str):
+        raise ProvenanceError("reviewer_display_name must be a string")
+    if not (REVIEWER_DISPLAY_NAME_MIN <= len(value) <= REVIEWER_DISPLAY_NAME_MAX):
+        raise ProvenanceError(
+            "reviewer_display_name must be "
+            f"{REVIEWER_DISPLAY_NAME_MIN}-{REVIEWER_DISPLAY_NAME_MAX} characters"
+        )
+    for ch in value:
+        if ord(ch) < 0x20 or ord(ch) == 0x7F:
+            raise ProvenanceError(
+                "reviewer_display_name must not contain control characters"
+            )
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Canonical JSON for hashing (schema 1.1.0)
+# ---------------------------------------------------------------------------
+
+
+def _reject_floats(obj, path: str = "") -> None:
+    """Recursively reject floating-point values for canonical hash structures.
+
+    Floats are forbidden in audit/receipt structures because their JSON
+    serialization can differ across platforms, breaking hash stability.
+    """
+    if isinstance(obj, float):
+        raise ProvenanceError(
+            f"floating-point value at {path or '<root>'} is not allowed in "
+            "canonical hash structures"
+        )
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            _reject_floats(val, f"{path}{key}.")
+    elif isinstance(obj, (list, tuple)):
+        for idx, item in enumerate(obj):
+            _reject_floats(item, f"{path}[{idx}].")
+
+
+def canonical_json_bytes(obj) -> bytes:
+    """Serialize to deterministic UTF-8 canonical JSON bytes for hashing.
+
+    Rules (must stay stable forever once a structure is hashed):
+    - sort_keys=True
+    - separators=(",", ":")
+    - ensure_ascii=False
+    - allow_nan=False
+    - no trailing whitespace / no trailing newline
+    - floating-point values are rejected
+    """
+    _reject_floats(obj)
+    text = json.dumps(
+        obj,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return text.encode("utf-8")
+
+
+def canonical_sha256(obj) -> str:
+    """SHA-256 hex digest of the canonical JSON bytes of obj."""
+    return hashlib.sha256(canonical_json_bytes(obj)).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Supporting-source rules (schema 1.1.0)
+# ---------------------------------------------------------------------------
+
+_HTTPS_URL_PATTERN = re.compile(r"https://[^\s]+", re.IGNORECASE)
+
+
+def _is_valid_https_url(value) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    if not value.lower().startswith("https://"):
+        return False
+    # Reject whitespace and control characters inside the URL.
+    if any(ord(c) <= 0x20 or ord(c) == 0x7F for c in value):
+        return False
+    return True
+
+
+def validate_supporting_sources(
+    *,
+    status: str,
+    source_url: str | None,
+    supporting_sources: list | None,
+    reviewer_id: str | None = None,
+    reviewer_display_name: str | None = None,
+    review_timestamp_utc: str | None = None,
+    notes: str | None = None,
+) -> None:
+    """Enforce schema 1.1.0 supporting-source and retraction rules for a claim.
+
+    - VERIFIED requires at least one valid supporting HTTPS URL. The legacy
+      source_url may satisfy this; supporting_sources are optional extras.
+    - RETRACTED requires reviewer identity, review timestamp, and notes.
+    """
+    if status == "VERIFIED":
+        candidates = []
+        if source_url:
+            candidates.append(source_url)
+        for url in supporting_sources or []:
+            candidates.append(url)
+        if not any(_is_valid_https_url(u) for u in candidates):
+            raise ProvenanceError(
+                "VERIFIED claim requires at least one valid supporting HTTPS URL"
+            )
+    elif status == "RETRACTED":
+        # Schema 1.1.0 retraction requirements apply when the new-style
+        # reviewer identity fields are in use. Legacy 1.0.0 retractions
+        # (reviewer/review_date only) are still governed by build_claim.
+        if reviewer_id is not None or reviewer_display_name is not None:
+            validate_reviewer_id(reviewer_id)
+            validate_reviewer_display_name(reviewer_display_name)
+            _require_utc_timestamp(review_timestamp_utc, "claim.review_timestamp_utc")
+            _require_str(notes, "claim.notes (RETRACTED claims require explanatory notes)")
+
+
+# ---------------------------------------------------------------------------
 # Section builders — each returns a dict with stable field ordering
 # ---------------------------------------------------------------------------
 
@@ -416,7 +575,19 @@ def build_claim(
     retrieval_date: str | None = None,
     reviewer: str | None = None,
     review_date: str | None = None,
+    supporting_sources: list[str] | None = None,
+    reviewer_id: str | None = None,
+    reviewer_display_name: str | None = None,
+    review_timestamp_utc: str | None = None,
+    notes: str | None = None,
 ) -> dict:
+    """Build a factual-claim entry (schema 1.1.0).
+
+    Backward compatible with 1.0.0 call signatures: the legacy ``reviewer``
+    and ``review_date`` fields still work. Schema 1.1.0 adds
+    ``supporting_sources``, ``reviewer_id``, ``reviewer_display_name``,
+    ``review_timestamp_utc``, and ``notes``.
+    """
     _require_str(claim_text, "claim.claim_text")
     _require_str(source_url, "claim.source_url")
     _assert_no_secret_value(source_url)
@@ -424,10 +595,39 @@ def build_claim(
     if retrieval_date is not None:
         _require_utc_timestamp(retrieval_date, "claim.retrieval_date")
 
+    if supporting_sources is not None:
+        if not isinstance(supporting_sources, (list, tuple)):
+            raise ProvenanceError("claim.supporting_sources must be a list")
+        for url in supporting_sources:
+            _require_str(url, "claim.supporting_sources[]")
+            _assert_no_secret_value(url)
+
     if status in ("VERIFIED", "RETRACTED"):
         # A human decision is meaningless without accountability.
-        _require_str(reviewer, f"claim.reviewer ({status} claims)")
-        _require_utc_timestamp(review_date, f"claim.review_date ({status} claims)")
+        # 1.0.0 path: legacy reviewer/review_date.
+        # 1.1.0 path: reviewer_id/reviewer_display_name/review_timestamp_utc.
+        if reviewer_id is not None or reviewer_display_name is not None:
+            validate_reviewer_id(reviewer_id)
+            validate_reviewer_display_name(reviewer_display_name)
+            _require_utc_timestamp(
+                review_timestamp_utc, "claim.review_timestamp_utc"
+            )
+        else:
+            _require_str(reviewer, f"claim.reviewer ({status} claims)")
+            _require_utc_timestamp(
+                review_date, f"claim.review_date ({status} claims)"
+            )
+
+    # Schema 1.1.0 supporting-source / retraction rules.
+    validate_supporting_sources(
+        status=status,
+        source_url=source_url,
+        supporting_sources=supporting_sources,
+        reviewer_id=reviewer_id,
+        reviewer_display_name=reviewer_display_name,
+        review_timestamp_utc=review_timestamp_utc,
+        notes=notes,
+    )
 
     return {
         "claim_text": claim_text,
@@ -437,6 +637,11 @@ def build_claim(
         "status": status,
         "reviewer": reviewer,
         "review_date": review_date,
+        "supporting_sources": list(supporting_sources) if supporting_sources else None,
+        "reviewer_id": reviewer_id,
+        "reviewer_display_name": reviewer_display_name,
+        "review_timestamp_utc": review_timestamp_utc,
+        "notes": notes,
     }
 
 
@@ -471,7 +676,7 @@ def build_output_section(
     review_status: str = DEFAULT_REVIEW_STATUS,
     compute_hash: bool = True,
 ) -> dict:
-    _require_enum(review_status, "output.review_status", REVIEW_STATUSES)
+    _require_enum(review_status, "output.review_status", OUTPUT_REVIEW_STATUSES)
     resolved = resolve_task_path(task_dir, local_path, must_exist=compute_hash)
     rel = os.path.relpath(resolved, os.path.realpath(task_dir))
     return {
@@ -542,7 +747,12 @@ def build_manifest(
 
 
 def validate_manifest(manifest: dict) -> None:
-    """Validate required fields and allowed enum values for a full manifest."""
+    """Validate required fields and allowed enum values for a full manifest.
+
+    Accepts schema 1.0.0 and 1.1.0 manifests. 1.0.0 manifests are validated
+    against the legacy rules; 1.1.0 manifests additionally enforce reviewer
+    identity formats and supporting-source rules.
+    """
     if not isinstance(manifest, dict):
         raise ProvenanceError("manifest must be a mapping")
     for field in _MANIFEST_FIELD_ORDER:
@@ -554,7 +764,13 @@ def validate_manifest(manifest: dict) -> None:
                   "pilot_profile", "review_status"):
         if field not in task:
             raise ProvenanceError(f"task missing required field: {field}")
+    if task["schema_version"] not in SUPPORTED_SCHEMA_VERSIONS:
+        raise ProvenanceError(
+            f"unsupported schema_version: {task['schema_version']!r}"
+        )
     _require_enum(task["review_status"], "task.review_status", REVIEW_STATUSES)
+
+    is_1_1 = task["schema_version"] == SCHEMA_VERSION
 
     for asset in manifest["assets"]:
         _require_enum(asset.get("asset_type"), "asset.asset_type", ASSET_TYPES)
@@ -572,10 +788,82 @@ def validate_manifest(manifest: dict) -> None:
     for claim in manifest["factual_claims"]:
         _require_enum(claim.get("status"), "claim.status", CLAIM_STATUSES)
         if claim["status"] in ("VERIFIED", "RETRACTED"):
-            if not claim.get("reviewer") or not claim.get("review_date"):
+            if is_1_1 and (claim.get("reviewer_id") or claim.get("reviewer_display_name")):
+                validate_reviewer_id(claim.get("reviewer_id"))
+                validate_reviewer_display_name(claim.get("reviewer_display_name"))
+                _require_utc_timestamp(
+                    claim.get("review_timestamp_utc"), "claim.review_timestamp_utc"
+                )
+            elif not claim.get("reviewer") or not claim.get("review_date"):
                 raise ProvenanceError(
                     f"{claim['status']} claim requires reviewer and review_date"
                 )
+        if is_1_1:
+            validate_supporting_sources(
+                status=claim["status"],
+                source_url=claim.get("source_url"),
+                supporting_sources=claim.get("supporting_sources"),
+                reviewer_id=claim.get("reviewer_id"),
+                reviewer_display_name=claim.get("reviewer_display_name"),
+                review_timestamp_utc=claim.get("review_timestamp_utc"),
+                notes=claim.get("notes"),
+            )
+
+    output = manifest.get("output")
+    if output is not None and "review_status" in output:
+        allowed = OUTPUT_REVIEW_STATUSES if is_1_1 else REVIEW_STATUSES
+        _require_enum(output["review_status"], "output.review_status", allowed)
+
+
+def migrate_manifest_1_0_0_to_1_1_0(manifest: dict) -> dict:
+    """Explicitly migrate a 1.0.0 manifest to schema 1.1.0.
+
+    Returns a NEW manifest dict; the input is never mutated. The migration
+    is additive-only: all 1.0.0 content is preserved, new 1.1.0 fields are
+    initialized to None, and task.schema_version is updated. A 1.0.0
+    manifest is never silently reinterpreted or overwritten in place.
+    """
+    if not isinstance(manifest, dict):
+        raise ProvenanceError("manifest must be a mapping")
+    task = manifest.get("task")
+    if not isinstance(task, dict):
+        raise ProvenanceError("manifest missing task section")
+    if task.get("schema_version") != SCHEMA_VERSION_1_0_0:
+        raise ProvenanceError(
+            "migrate_manifest_1_0_0_to_1_1_0 requires a 1.0.0 manifest; "
+            f"got {task.get('schema_version')!r}"
+        )
+    # Validate the 1.0.0 manifest before migrating.
+    validate_manifest(manifest)
+
+    migrated = json.loads(json.dumps(manifest))  # deep copy via JSON
+    migrated["task"]["schema_version"] = SCHEMA_VERSION
+    for claim in migrated.get("factual_claims", []):
+        claim.setdefault("supporting_sources", None)
+        claim.setdefault("reviewer_id", None)
+        claim.setdefault("reviewer_display_name", None)
+        claim.setdefault("review_timestamp_utc", None)
+        claim.setdefault("notes", None)
+    validate_manifest(migrated)
+    return migrated
+
+
+def assert_no_blocking_claims(manifest: dict) -> None:
+    """Fail if active UNVERIFIED or RETRACTED claims block task approval.
+
+    Schema 1.1.0 lifecycle rule: a task cannot be approved while any claim
+    is still UNVERIFIED or has been RETRACTED without resolution.
+    """
+    blocking = [
+        c for c in manifest.get("factual_claims", [])
+        if c.get("status") in ("UNVERIFIED", "RETRACTED")
+    ]
+    if blocking:
+        statuses = sorted({c["status"] for c in blocking})
+        raise ProvenanceError(
+            f"cannot approve: {len(blocking)} claim(s) in blocking state(s) "
+            f"{statuses}"
+        )
 
 
 def transition_review_status(manifest: dict, new_status: str) -> dict:
@@ -591,14 +879,18 @@ def transition_review_status(manifest: dict, new_status: str) -> dict:
             f"invalid review-status transition: {current} -> {new_status}"
         )
     if new_status == "APPROVED":
-        unverified = [
-            c for c in manifest.get("factual_claims", [])
-            if c.get("status") == "UNVERIFIED"
-        ]
-        if unverified:
-            raise ProvenanceError(
-                "cannot approve: factual claims remain UNVERIFIED"
-            )
+        if manifest["task"].get("schema_version") == SCHEMA_VERSION:
+            # Schema 1.1.0: UNVERIFIED and RETRACTED claims block approval.
+            assert_no_blocking_claims(manifest)
+        else:
+            unverified = [
+                c for c in manifest.get("factual_claims", [])
+                if c.get("status") == "UNVERIFIED"
+            ]
+            if unverified:
+                raise ProvenanceError(
+                    "cannot approve: factual claims remain UNVERIFIED"
+                )
     manifest["task"]["review_status"] = new_status
     if manifest.get("output"):
         manifest["output"]["review_status"] = new_status
