@@ -69,9 +69,19 @@ class _TaskDirBase(unittest.TestCase):
 
     def simple_manifest(self, claims=None):
         self.write_file("final.mp4", b"out")
+        # Give every claim a deterministic claim_id for schema 1.2.0.
+        claims = claims or []
+        for ordinal, claim in enumerate(claims):
+            if claim.get("claim_id") is None:
+                claim["claim_id"] = prov.generate_claim_id(
+                    task_id="task-001",
+                    ordinal=ordinal,
+                    claim_text=claim["claim_text"],
+                    source_url=claim["source_url"],
+                )
         return prov.build_manifest(
             task=self.task_section(),
-            factual_claims=claims or [],
+            factual_claims=claims,
             output=prov.build_output_section(self.task_dir, local_path="final.mp4"),
         )
 
@@ -82,10 +92,10 @@ class _TaskDirBase(unittest.TestCase):
 
 
 class TestSchemaVersioning(_TaskDirBase):
-    def test_new_manifests_default_to_1_1_0(self):
+    def test_new_manifests_default_to_1_2_0(self):
         task = self.task_section()
-        self.assertEqual(task["schema_version"], "1.1.0")
-        self.assertEqual(prov.SCHEMA_VERSION, "1.1.0")
+        self.assertEqual(task["schema_version"], "1.2.0")
+        self.assertEqual(prov.SCHEMA_VERSION, "1.2.0")
 
     def test_1_0_0_manifest_still_validates(self):
         manifest = self.simple_manifest()
@@ -105,22 +115,31 @@ class TestSchemaVersioning(_TaskDirBase):
 
     def test_migration_1_0_0_to_1_1_0_is_explicit_and_non_mutating(self):
         self.write_file("final.mp4", b"out")
+        claim_id = prov.generate_claim_id(
+            task_id="task-001",
+            ordinal=0,
+            claim_text="Bitcoin supply is capped at 21 million.",
+            source_url="https://bitcoin.org/bitcoin.pdf",
+        )
         claim = prov.build_claim(
             claim_text="Bitcoin supply is capped at 21 million.",
             source_url="https://bitcoin.org/bitcoin.pdf",
             status="VERIFIED",
             reviewer="rick",
             review_date=UTC2,
+            claim_id=claim_id,
         )
-        for key in ("supporting_sources", "reviewer_id",
-                    "reviewer_display_name", "review_timestamp_utc", "notes"):
-            claim.pop(key, None)
         manifest = prov.build_manifest(
             task=self.task_section(),
             factual_claims=[claim],
             output=prov.build_output_section(self.task_dir, local_path="final.mp4"),
         )
+        # Strip 1.1.0+ fields to simulate a true 1.0.0 doc.
         manifest["task"]["schema_version"] = "1.0.0"
+        for claim in manifest["factual_claims"]:
+            for key in ("claim_id", "supporting_sources", "reviewer_id",
+                        "reviewer_display_name", "review_timestamp_utc", "notes"):
+                claim.pop(key, None)
         original_json = json.dumps(manifest, sort_keys=True)
 
         migrated = prov.migrate_manifest_1_0_0_to_1_1_0(manifest)

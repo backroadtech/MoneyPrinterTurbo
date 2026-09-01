@@ -33,9 +33,10 @@ import re
 import tempfile
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = "1.1.0"
+SCHEMA_VERSION = "1.2.0"
 SCHEMA_VERSION_1_0_0 = "1.0.0"
-SUPPORTED_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION, SCHEMA_VERSION_1_0_0})
+SCHEMA_VERSION_1_1_0 = "1.1.0"
+SUPPORTED_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION, SCHEMA_VERSION_1_0_0, SCHEMA_VERSION_1_1_0})
 
 # ---------------------------------------------------------------------------
 # Enums (closed sets)
@@ -60,6 +61,9 @@ REVIEWER_ID_MIN = 1
 REVIEWER_ID_MAX = 64
 REVIEWER_DISPLAY_NAME_MIN = 1
 REVIEWER_DISPLAY_NAME_MAX = 128
+
+# Claim ID rules (schema 1.2.0).
+CLAIM_ID_PATTERN = re.compile(r"claim-[0-9a-f]{32}")
 
 DEFAULT_REVIEW_STATUS = "NEEDS_HUMAN_REVIEW"
 NEEDS_HUMAN_REVIEW_MARKER = "__NEEDS_HUMAN_REVIEW"
@@ -351,6 +355,84 @@ def validate_reviewer_display_name(value) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Claim ID generation and validation (schema 1.2.0)
+# ---------------------------------------------------------------------------
+
+
+def _normalize_claim_text_for_identity(text: str) -> str:
+    """Normalize claim text for identity hashing only.
+
+    Rules:
+    - Unicode NFC normalization
+    - CRLF and CR converted to LF
+    - Trim leading/trailing whitespace
+    - Preserve internal whitespace
+    """
+    import unicodedata
+    # NFC normalization
+    normalized = unicodedata.normalize("NFC", text)
+    # CRLF and CR to LF
+    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+    # Trim leading/trailing whitespace (including newlines)
+    normalized = normalized.strip()
+    return normalized
+
+
+def generate_claim_id(
+    *,
+    task_id: str,
+    ordinal: int,
+    claim_text: str,
+    source_url: str,
+) -> str:
+    """Generate a deterministic, immutable claim ID.
+
+    The ID is derived from SHA-256 of canonical JSON containing:
+    - task_id
+    - zero-based original ordinal
+    - normalized claim text (NFC, CRLF->LF, trimmed)
+    - validated source_url exactly as stored
+
+    Returns: "claim-" + first 128 bits of SHA-256 (32 lowercase hex chars)
+
+    Raises ProvenanceError on collision (same inputs produce same ID).
+    """
+    _require_str(task_id, "task_id")
+    if not isinstance(ordinal, int) or ordinal < 0:
+        raise ProvenanceError("ordinal must be a non-negative integer")
+    _require_str(claim_text, "claim_text")
+    _require_str(source_url, "source_url")
+
+    normalized_text = _normalize_claim_text_for_identity(claim_text)
+
+    canonical = {
+        "task_id": task_id,
+        "ordinal": ordinal,
+        "claim_text": normalized_text,
+        "source_url": source_url,
+    }
+
+    # Use canonical JSON serialization for deterministic hashing
+    canonical_bytes = canonical_json_bytes(canonical)
+    full_hash = hashlib.sha256(canonical_bytes).hexdigest()
+    # First 128 bits = 32 hex characters
+    claim_id = f"claim-{full_hash[:32]}"
+
+    return claim_id
+
+
+def validate_claim_id(value, field: str = "claim_id") -> str:
+    """Validate a claim_id: must match claim-[0-9a-f]{32}."""
+    if not isinstance(value, str):
+        raise ProvenanceError(f"{field} must be a string")
+    if not CLAIM_ID_PATTERN.fullmatch(value):
+        raise ProvenanceError(
+            f"{field} must match pattern claim-[0-9a-f]{{32}}; got {value!r}"
+        )
+    return value
+
+
+# ---------------------------------------------------------------------------
 # Canonical JSON for hashing (schema 1.1.0)
 # ---------------------------------------------------------------------------
 
@@ -580,13 +662,13 @@ def build_claim(
     reviewer_display_name: str | None = None,
     review_timestamp_utc: str | None = None,
     notes: str | None = None,
+    claim_id: str | None = None,
 ) -> dict:
-    """Build a factual-claim entry (schema 1.1.0).
+    """Build a factual-claim entry (schema 1.2.0).
 
-    Backward compatible with 1.0.0 call signatures: the legacy ``reviewer``
-    and ``review_date`` fields still work. Schema 1.1.0 adds
-    ``supporting_sources``, ``reviewer_id``, ``reviewer_display_name``,
-    ``review_timestamp_utc``, and ``notes``.
+    Backward compatible with 1.0.0/1.1.0 call signatures: the legacy ``reviewer``
+    and ``review_date`` fields still work. Schema 1.2.0 adds the required
+    ``claim_id`` field.
     """
     _require_str(claim_text, "claim.claim_text")
     _require_str(source_url, "claim.source_url")
@@ -629,7 +711,12 @@ def build_claim(
         notes=notes,
     )
 
+    # Schema 1.2.0: claim_id is required for new manifests.
+    if claim_id is not None:
+        validate_claim_id(claim_id, "claim.claim_id")
+
     return {
+        "claim_id": claim_id,
         "claim_text": claim_text,
         "source_url": source_url,
         "source_publication_date": source_publication_date,
@@ -734,11 +821,32 @@ def build_manifest(
 ) -> dict:
     if not isinstance(task, dict) or task.get("schema_version") != SCHEMA_VERSION:
         raise ProvenanceError("manifest requires a valid task section")
+
+    # Schema 1.2.0: claim_id is REQUIRED for every claim. build_manifest does
+    # NOT silently generate missing claim_ids — that is the exclusive job of
+    # pilot_prepare.py (new prepared tasks), migrate_manifest_to_1_2_0 (explicit
+    # migration), or an explicit caller using generate_claim_id().
+    claims = factual_claims or []
+    seen_ids: set[str] = set()
+    for ordinal, claim in enumerate(claims):
+        cid = claim.get("claim_id")
+        if cid is None:
+            raise ProvenanceError(
+                f"schema 1.2.0 requires claim_id for every claim; "
+                f"claim at ordinal {ordinal} is missing claim_id"
+            )
+        validate_claim_id(cid, f"claim[{ordinal}].claim_id")
+        if cid in seen_ids:
+            raise ProvenanceError(
+                f"duplicate claim_id in manifest: {cid!r}"
+            )
+        seen_ids.add(cid)
+
     manifest = {
         "task": task,
         "script": script,
         "assets": assets or [],
-        "factual_claims": factual_claims or [],
+        "factual_claims": claims,
         "ai_generations": ai_generations or [],
         "output": output,
     }
@@ -749,9 +857,10 @@ def build_manifest(
 def validate_manifest(manifest: dict) -> None:
     """Validate required fields and allowed enum values for a full manifest.
 
-    Accepts schema 1.0.0 and 1.1.0 manifests. 1.0.0 manifests are validated
+    Accepts schema 1.0.0, 1.1.0, and 1.2.0 manifests. 1.0.0 manifests are validated
     against the legacy rules; 1.1.0 manifests additionally enforce reviewer
-    identity formats and supporting-source rules.
+    identity formats and supporting-source rules; 1.2.0 manifests additionally
+    enforce claim_id presence and uniqueness.
     """
     if not isinstance(manifest, dict):
         raise ProvenanceError("manifest must be a mapping")
@@ -770,7 +879,8 @@ def validate_manifest(manifest: dict) -> None:
         )
     _require_enum(task["review_status"], "task.review_status", REVIEW_STATUSES)
 
-    is_1_1 = task["schema_version"] == SCHEMA_VERSION
+    is_1_1_plus = task["schema_version"] in (SCHEMA_VERSION_1_1_0, SCHEMA_VERSION)
+    is_1_2 = task["schema_version"] == SCHEMA_VERSION
 
     for asset in manifest["assets"]:
         _require_enum(asset.get("asset_type"), "asset.asset_type", ASSET_TYPES)
@@ -785,10 +895,11 @@ def validate_manifest(manifest: dict) -> None:
                         f"provider asset missing required field: {field}"
                     )
 
+    seen_claim_ids: set[str] = set()
     for claim in manifest["factual_claims"]:
         _require_enum(claim.get("status"), "claim.status", CLAIM_STATUSES)
         if claim["status"] in ("VERIFIED", "RETRACTED"):
-            if is_1_1 and (claim.get("reviewer_id") or claim.get("reviewer_display_name")):
+            if is_1_1_plus and (claim.get("reviewer_id") or claim.get("reviewer_display_name")):
                 validate_reviewer_id(claim.get("reviewer_id"))
                 validate_reviewer_display_name(claim.get("reviewer_display_name"))
                 _require_utc_timestamp(
@@ -798,7 +909,7 @@ def validate_manifest(manifest: dict) -> None:
                 raise ProvenanceError(
                     f"{claim['status']} claim requires reviewer and review_date"
                 )
-        if is_1_1:
+        if is_1_1_plus:
             validate_supporting_sources(
                 status=claim["status"],
                 source_url=claim.get("source_url"),
@@ -808,10 +919,23 @@ def validate_manifest(manifest: dict) -> None:
                 review_timestamp_utc=claim.get("review_timestamp_utc"),
                 notes=claim.get("notes"),
             )
+        # Schema 1.2.0: claim_id is required and must be unique.
+        if is_1_2:
+            claim_id = claim.get("claim_id")
+            if claim_id is None:
+                raise ProvenanceError(
+                    "schema 1.2.0 requires claim_id for every claim"
+                )
+            validate_claim_id(claim_id, "claim.claim_id")
+            if claim_id in seen_claim_ids:
+                raise ProvenanceError(
+                    f"duplicate claim_id in manifest: {claim_id!r}"
+                )
+            seen_claim_ids.add(claim_id)
 
     output = manifest.get("output")
     if output is not None and "review_status" in output:
-        allowed = OUTPUT_REVIEW_STATUSES if is_1_1 else REVIEW_STATUSES
+        allowed = OUTPUT_REVIEW_STATUSES if is_1_1_plus else REVIEW_STATUSES
         _require_enum(output["review_status"], "output.review_status", allowed)
 
 
@@ -822,6 +946,8 @@ def migrate_manifest_1_0_0_to_1_1_0(manifest: dict) -> dict:
     is additive-only: all 1.0.0 content is preserved, new 1.1.0 fields are
     initialized to None, and task.schema_version is updated. A 1.0.0
     manifest is never silently reinterpreted or overwritten in place.
+
+    APPROVED and REJECTED manifests cannot be migrated.
     """
     if not isinstance(manifest, dict):
         raise ProvenanceError("manifest must be a mapping")
@@ -833,17 +959,89 @@ def migrate_manifest_1_0_0_to_1_1_0(manifest: dict) -> dict:
             "migrate_manifest_1_0_0_to_1_1_0 requires a 1.0.0 manifest; "
             f"got {task.get('schema_version')!r}"
         )
+    # APPROVED and REJECTED manifests cannot be migrated.
+    review_status = task.get("review_status")
+    if review_status in ("APPROVED", "REJECTED"):
+        raise ProvenanceError(
+            f"cannot migrate {review_status} manifest"
+        )
     # Validate the 1.0.0 manifest before migrating.
     validate_manifest(manifest)
 
     migrated = json.loads(json.dumps(manifest))  # deep copy via JSON
-    migrated["task"]["schema_version"] = SCHEMA_VERSION
+    migrated["task"]["schema_version"] = SCHEMA_VERSION_1_1_0
     for claim in migrated.get("factual_claims", []):
         claim.setdefault("supporting_sources", None)
         claim.setdefault("reviewer_id", None)
         claim.setdefault("reviewer_display_name", None)
         claim.setdefault("review_timestamp_utc", None)
         claim.setdefault("notes", None)
+    validate_manifest(migrated)
+    return migrated
+
+
+def migrate_manifest_to_1_2_0(manifest: dict) -> dict:
+    """Explicitly migrate a 1.0.0 or 1.1.0 manifest to schema 1.2.0.
+
+    Returns a NEW manifest dict; the input is never mutated. The migration
+    is deterministic and additive-only: all existing content is preserved,
+    claim_id is generated for every claim using the deterministic formula,
+    and task.schema_version is updated.
+
+    APPROVED and REJECTED manifests cannot be migrated.
+    Collisions in claim_id generation fail closed.
+    """
+    if not isinstance(manifest, dict):
+        raise ProvenanceError("manifest must be a mapping")
+    task = manifest.get("task")
+    if not isinstance(task, dict):
+        raise ProvenanceError("manifest missing task section")
+    source_version = task.get("schema_version")
+    if source_version not in (SCHEMA_VERSION_1_0_0, SCHEMA_VERSION_1_1_0):
+        raise ProvenanceError(
+            "migrate_manifest_to_1_2_0 requires a 1.0.0 or 1.1.0 manifest; "
+            f"got {source_version!r}"
+        )
+    # APPROVED and REJECTED manifests cannot be migrated.
+    review_status = task.get("review_status")
+    if review_status in ("APPROVED", "REJECTED"):
+        raise ProvenanceError(
+            f"cannot migrate {review_status} manifest"
+        )
+    # Validate the source manifest before migrating.
+    validate_manifest(manifest)
+
+    migrated = json.loads(json.dumps(manifest))  # deep copy via JSON
+    task_id = migrated["task"]["task_id"]
+
+    # Generate claim_id for every claim.
+    seen_ids: set[str] = set()
+    for ordinal, claim in enumerate(migrated.get("factual_claims", [])):
+        claim_id = generate_claim_id(
+            task_id=task_id,
+            ordinal=ordinal,
+            claim_text=claim["claim_text"],
+            source_url=claim["source_url"],
+        )
+        if claim_id in seen_ids:
+            raise ProvenanceError(
+                f"claim_id collision during migration: {claim_id!r}"
+            )
+        seen_ids.add(claim_id)
+        claim["claim_id"] = claim_id
+
+    # Update schema version.
+    migrated["task"]["schema_version"] = SCHEMA_VERSION
+
+    # If migrating from 1.0.0, also add 1.1.0 fields.
+    if source_version == SCHEMA_VERSION_1_0_0:
+        for claim in migrated.get("factual_claims", []):
+            claim.setdefault("supporting_sources", None)
+            claim.setdefault("reviewer_id", None)
+            claim.setdefault("reviewer_display_name", None)
+            claim.setdefault("review_timestamp_utc", None)
+            claim.setdefault("notes", None)
+
     validate_manifest(migrated)
     return migrated
 

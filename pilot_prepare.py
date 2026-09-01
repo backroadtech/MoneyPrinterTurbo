@@ -250,12 +250,20 @@ def prepare(args: argparse.Namespace) -> int:
         if not source:
             raise PrepareError(f"--claim {index + 1} requires a --claim-source")
         try:
+            # Generate deterministic claim_id for schema 1.2.0.
+            claim_id = prov.generate_claim_id(
+                task_id=os.path.basename(task_dir),
+                ordinal=index,
+                claim_text=claim_text,
+                source_url=source,
+            )
             claims.append(
                 prov.build_claim(
                     claim_text=claim_text,
                     source_url=source,
                     status="UNVERIFIED",
                     retrieval_date=prov.utc_now_iso(),
+                    claim_id=claim_id,
                 )
             )
         except prov.ProvenanceError as exc:

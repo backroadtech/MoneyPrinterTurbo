@@ -177,9 +177,19 @@ class _ReviewTestBase(unittest.TestCase):
         output = prov.build_output_section(
             self.task_dir, local_path="final.mp4", review_status=review_status
         )
+        # Give every claim a deterministic claim_id for schema 1.2.0.
+        claims = claims or []
+        for ordinal, claim in enumerate(claims):
+            if claim.get("claim_id") is None:
+                claim["claim_id"] = prov.generate_claim_id(
+                    task_id="task-001",
+                    ordinal=ordinal,
+                    claim_text=claim["claim_text"],
+                    source_url=claim["source_url"],
+                )
         manifest = prov.build_manifest(
             task=task, script=script, assets=assets or [],
-            factual_claims=claims or [], output=output,
+            factual_claims=claims, output=output,
         )
         if write:
             prov.write_manifest_atomic(self.task_dir, manifest)
@@ -197,10 +207,19 @@ class _ReviewTestBase(unittest.TestCase):
         return path
 
     def verified_claim(self):
+        claim_text = "Bitcoin supply is capped at 21 million."
+        source_url = "https://bitcoin.org/bitcoin.pdf"
+        claim_id = prov.generate_claim_id(
+            task_id="task-001",
+            ordinal=0,
+            claim_text=claim_text,
+            source_url=source_url,
+        )
         return prov.build_claim(
-            claim_text="Bitcoin supply is capped at 21 million.",
-            source_url="https://bitcoin.org/bitcoin.pdf",
+            claim_text=claim_text,
+            source_url=source_url,
             status="VERIFIED", reviewer="rick", review_date=UTC2,
+            claim_id=claim_id,
         )
 
     def make_approval_receipt(self, manifest):
@@ -279,7 +298,7 @@ class TestStatusCommand(_ReviewTestBase):
         code, out, _ = self.run_cli("status", "--task-dir", self.task_dir)
         self.assertEqual(code, 0)
         self.assertIn("task_id:", out)
-        self.assertIn("1.1.0", out)
+        self.assertIn("1.2.0", out)
         self.assertIn("NEEDS_HUMAN_REVIEW", out)
         self.assertIn("approval readiness:   BLOCKED", out)
 

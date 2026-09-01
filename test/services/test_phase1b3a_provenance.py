@@ -407,6 +407,14 @@ class TestManifest(_TaskDirTestBase):
         self.write_file("script.txt", b"script body")
         self.write_file("asset.mp4", b"video-bytes")
         self.write_file("final.mp4", b"out")
+        claim_text = "Bitcoin supply is capped at 21 million."
+        source_url = "https://bitcoin.org/bitcoin.pdf"
+        claim_id = prov.generate_claim_id(
+            task_id="task-001",
+            ordinal=0,
+            claim_text=claim_text,
+            source_url=source_url,
+        )
         return prov.build_manifest(
             task=self.task_section(),
             script=prov.build_script_section(
@@ -429,9 +437,10 @@ class TestManifest(_TaskDirTestBase):
             ],
             factual_claims=[
                 prov.build_claim(
-                    claim_text="Bitcoin supply is capped at 21 million.",
-                    source_url="https://bitcoin.org/bitcoin.pdf",
+                    claim_text=claim_text,
+                    source_url=source_url,
                     retrieval_date=UTC,
+                    claim_id=claim_id,
                 )
             ],
             ai_generations=[
@@ -521,12 +530,21 @@ class TestTransitions(_TaskDirTestBase):
         self.write_file("final.mp4", b"out")
         claims = []
         if claim_status is not None:
+            claim_text = "claim"
+            source_url = "https://example.com/src"
+            claim_id = prov.generate_claim_id(
+                task_id="task-001",
+                ordinal=0,
+                claim_text=claim_text,
+                source_url=source_url,
+            )
             claims.append(
                 prov.build_claim(
-                    claim_text="claim",
-                    source_url="https://example.com/src",
+                    claim_text=claim_text,
+                    source_url=source_url,
                     status=claim_status,
                     retrieval_date=UTC,
+                    claim_id=claim_id,
                     **claim_kwargs,
                 )
             )

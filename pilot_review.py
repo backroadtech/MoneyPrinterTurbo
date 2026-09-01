@@ -308,6 +308,17 @@ def _assemble_state(task_dir: str) -> dict:
         state["lock_error"] = str(exc)
         failures.append(f"lock:{exc}")
 
+    # --- transaction journal (read-only detection) ---
+    try:
+        journal = ri.read_transaction_journal(base)
+        state["transaction_journal"] = journal
+        if journal is not None:
+            failures.append("INCOMPLETE_TRANSACTION")
+    except ri.ReviewIntegrityError as exc:
+        state["transaction_journal"] = None
+        state["transaction_journal_error"] = str(exc)
+        failures.append("INCOMPLETE_TRANSACTION")
+
     # --- unexpected partial/temp files ---
     partials = []
     for sub in ("review-events", "approvals", "manifest-history"):
@@ -480,6 +491,21 @@ def cmd_status(args: argparse.Namespace) -> int:
     for reason in ready_reasons:
         print(f"    - {_truncate(reason)}")
 
+    # Transaction journal status (read-only).
+    journal = state.get("transaction_journal")
+    journal_error = state.get("transaction_journal_error")
+    if journal is None and journal_error is None:
+        print("  transaction status:   none")
+    else:
+        print(f"  transaction status:   INCOMPLETE_TRANSACTION")
+        if journal is not None:
+            print(f"    stage:              {journal.get('transaction_stage')}")
+            print(f"    operation:          {journal.get('operation')}")
+            print(f"    claim_id:           {journal.get('claim_id')}")
+            print(f"    transaction_id:     {journal.get('transaction_id')}")
+        else:
+            print(f"    error:              {_truncate(journal_error)}")
+
     if hard_failure:
         return EXIT_FAILURE
     return EXIT_OK
@@ -512,6 +538,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
                 "approvals": "UNCOMMITTED_TAIL",
                 "lock": "LOCK_STATE",
                 "partial-files-present": "PARTIAL_FILES",
+                "INCOMPLETE_TRANSACTION": "INCOMPLETE_TRANSACTION",
             }.get(category, category.upper().replace("-", "_"))
             if code not in reason_codes:
                 reason_codes.append(code)

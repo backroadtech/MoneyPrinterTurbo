@@ -1,12 +1,12 @@
-# Provenance Manifest — Phase 1B.3A / 1B.3C.2A
+# Provenance Manifest — Phase 1B.3A / 1B.3C.2A / 1B.3C.2B.2B
 
 Offline provenance and human-review manifest foundation for BrainTrustCrypto
 pilot tasks.
 
-**Status:** foundation plus offline review-integrity primitives (schema
-1.1.0). This module is **not** integrated with rendering, providers,
-publishing, or review CLI commands. CLI integration is deferred to a later
-phase.
+**Status:** foundation plus offline review-integrity primitives and schema
+1.2.0 claim IDs with transaction journal (Phase 1B.3C.2B.2B). This module is
+**not** integrated with rendering, providers, publishing, or review CLI
+commands. CLI integration is deferred to a later phase.
 
 ## Purpose
 
@@ -27,7 +27,7 @@ Machine-readable schema: `docs/provenance-manifest-schema.json`
 ### 1. Task
 | Field | Notes |
 |---|---|
-| `schema_version` | `"1.1.0"` for new manifests; `"1.0.0"` manifests remain valid for read/validate and explicit migration only |
+| `schema_version` | `"1.2.0"` for new manifests; `"1.0.0"` and `"1.1.0"` manifests remain valid for read/validate and explicit migration only |
 | `task_id` | Non-empty string |
 | `created_at` | UTC ISO-8601 timestamp (offset required) |
 | `topic` | Non-empty string |
@@ -54,9 +54,24 @@ Rules enforced by `build_asset()`:
   may be omitted.
 
 ### 4. Factual claims
-`claim_text`, `source_url`, optional `source_publication_date` and
+`claim_id`, `claim_text`, `source_url`, optional `source_publication_date` and
 `retrieval_date`, and `status`: `UNVERIFIED` (default), `VERIFIED`, or
 `RETRACTED`.
+
+Schema 1.2.0 adds the required `claim_id` field: an immutable, deterministic
+identifier derived from SHA-256 of canonical JSON containing `task_id`,
+zero-based original `ordinal`, normalized `claim_text` (NFC, CRLF→LF,
+trimmed), and `source_url` exactly as stored. Format: `claim-` + 32 lowercase
+hex chars (first 128 bits of SHA-256).
+
+**Claim-ID contract:**
+- `build_manifest()` does **not** silently generate a missing `claim_id`.
+- A schema 1.2.0 claim without `claim_id` fails validation/building.
+- Claim IDs may be generated only by:
+  - `pilot_prepare.py` for new prepared tasks
+  - `migrate_manifest_to_1_2_0()` (explicit pure migration)
+  - an explicit caller using `generate_claim_id()`
+- Schema 1.0.0 and 1.1.0 claims remain valid without `claim_id`.
 
 Accountability (schema 1.0.0 legacy path): a `VERIFIED` or `RETRACTED` claim
 must name a `reviewer` and a `review_date`.
@@ -102,16 +117,24 @@ While unreviewed, the output filename carries the marker
 human decision. **No visible watermark is required** — the marker lives in
 the filename only.
 
-## Schema 1.1.0 and migration
+## Schema 1.2.0 and migration
 
-- New manifests are built with `schema_version = "1.1.0"`.
-- Existing `1.0.0` manifests remain valid: `validate_manifest()` accepts
-  both versions and applies the legacy rules to 1.0.0 documents.
+- New manifests are built with `schema_version = "1.2.0"`.
+- Existing `1.0.0` and `1.1.0` manifests remain valid: `validate_manifest()`
+  accepts all supported versions and applies the legacy rules to 1.0.0/1.1.0
+  documents.
+- `migrate_manifest_to_1_2_0()` performs an **explicit, additive-only**
+  migration from 1.0.0 or 1.1.0 to 1.2.0: it validates the source manifest,
+  deep-copies it, generates deterministic `claim_id` for every claim, sets
+  `schema_version` to `1.2.0`, and re-validates. The input dict is **never
+  mutated**. APPROVED and REJECTED manifests are rejected.
 - `migrate_manifest_1_0_0_to_1_1_0()` performs an **explicit, additive-only**
-  migration: it validates the 1.0.0 manifest, deep-copies it, sets
-  `schema_version` to `1.1.0`, initializes the new claim fields to `null`,
-  and re-validates. A 1.0.0 manifest is **never silently reinterpreted or
-  overwritten in place** — the input dict is not mutated.
+  migration from 1.0.0 to 1.1.0: it validates the 1.0.0 manifest, deep-copies
+  it, sets `schema_version` to `1.1.0`, initializes the new claim fields to
+  `null`, and re-validates. The input dict is **never mutated**. APPROVED and
+  REJECTED manifests are rejected.
+- A 1.0.0 or 1.1.0 manifest is **never silently reinterpreted or overwritten
+  in place**.
 
 ## Canonical JSON for hashes
 
@@ -188,6 +211,30 @@ tamper-proofing is claimed.**
 
 No operator CLI commands (approve/revoke/audit/recover-lock) are exposed
 yet.
+
+## Transaction journal (Phase 1B.3C.2B.2B)
+
+`review-transaction.json` — an atomic, hash-verified journal for multi-step
+review transactions (verify-claim, retract-claim). The journal records
+`schema_version`, `transaction_id`, `operation`, `starting_manifest_hash`,
+`proposed_manifest_hash`, `reviewer_id`, `reviewer_display_name`, `claim_id`,
+`transaction_stage`, `created_at_utc`, `lock_token`, and `journal_hash`.
+
+Stages: `INITIATED` → `LOCK_ACQUIRED` → `SNAPSHOT_CREATED` → `EVENT_CREATED`
+→ `CHECKPOINT_UPDATED` → `MANIFEST_WRITTEN` → `COMMITTED`.
+
+Rules:
+- Creation is atomic and exclusive; an existing journal blocks creation.
+- Stage updates are forward-only and verified against immutable fields.
+- A malformed or hash-mismatched journal fails closed on read.
+- `status` and `audit` always show transaction status: `none` when no journal
+  exists, `INCOMPLETE_TRANSACTION` (with stage/operation/claim_id) when a
+  journal exists or is malformed.
+- `status` and `audit` remain byte-for-byte read-only; they never create,
+  modify, or delete the journal.
+- A valid or malformed journal produces `INCOMPLETE_TRANSACTION` and exit 1.
+
+No claim mutation or transaction execution commands are exposed yet.
 
 ## Review states and transitions
 
