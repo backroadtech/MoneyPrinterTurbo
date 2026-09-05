@@ -888,29 +888,20 @@ def _validate_event_record(
         )
 
 
-def create_review_event_file(
-    task_dir: str,
+def _validate_event_inputs(
     *,
     event_type: str,
     reviewer_id: str,
     reviewer_display_name: str,
     timestamp_utc: str,
-    reason: str | None = None,
-    manifest_hash_before: str | None = None,
-    manifest_hash_after: str | None = None,
-    details: dict | None = None,
-    event_id: str | None = None,
-) -> dict:
-    """Create the next immutable review-event file without advancing the checkpoint.
-
-    Applies the full existing event validation and construction behavior,
-    then durably creates only the immutable event file (exclusive create,
-    fsync, never overwrite). The new event is an uncommitted tail: chain
-    validation fails closed on it until advance_review_event_checkpoint()
-    commits exactly this event. An existing uncommitted tail blocks further
-    creation (fail closed, no repair or rollback). Never advances the
-    checkpoint, overwrites or deletes events, repairs tails, or rolls back.
-    """
+    reason: str | None,
+    manifest_hash_before: str | None,
+    manifest_hash_after: str | None,
+    details: dict | None,
+    event_id: str | None,
+    event_id_required: bool,
+) -> None:
+    """Validate every event input. Performs no filesystem access."""
     if event_type not in EVENT_TYPES:
         raise ReviewIntegrityError(f"unknown event_type: {event_type!r}")
     _validate_reviewer(reviewer_id, reviewer_display_name)
@@ -932,16 +923,56 @@ def create_review_event_file(
             )
     if details is not None and not isinstance(details, dict):
         raise ReviewIntegrityError("details must be a mapping")
-    if event_id is not None:
-        if not isinstance(event_id, str) or not re.fullmatch(r"[0-9a-f]{32}", event_id):
+    if event_id is None:
+        if event_id_required:
             raise ReviewIntegrityError(
-                "event_id must be a 32-char lowercase hex string"
+                "event_id is required and must be frozen by the caller"
             )
+    elif not isinstance(event_id, str) or not re.fullmatch(r"[0-9a-f]{32}", event_id):
+        raise ReviewIntegrityError(
+            "event_id must be a 32-char lowercase hex string"
+        )
 
-    directory = _sub_dir(task_dir, REVIEW_EVENTS_DIR)
+
+def _construct_next_event(
+    task_dir: str,
+    *,
+    create_directory: bool,
+    event_type: str,
+    reviewer_id: str,
+    reviewer_display_name: str,
+    timestamp_utc: str,
+    reason: str | None,
+    manifest_hash_before: str | None,
+    manifest_hash_after: str | None,
+    details: dict | None,
+    event_id: str | None,
+    event_id_required: bool,
+) -> dict:
+    """Validate inputs and the committed chain, then build the exact next event.
+
+    Single shared construction path used by plan_review_event() (no
+    writes) and create_review_event_file() (durable exclusive create) so
+    the planner and the writer cannot drift. This helper performs no
+    filesystem mutation itself; the caller controls directory creation
+    through create_directory and performs any durable write.
+    """
+    _validate_event_inputs(
+        event_type=event_type,
+        reviewer_id=reviewer_id,
+        reviewer_display_name=reviewer_display_name,
+        timestamp_utc=timestamp_utc,
+        reason=reason,
+        manifest_hash_before=manifest_hash_before,
+        manifest_hash_after=manifest_hash_after,
+        details=details,
+        event_id=event_id,
+        event_id_required=event_id_required,
+    )
+    directory = _sub_dir(task_dir, REVIEW_EVENTS_DIR, create=create_directory)
     # Validate the existing committed chain before appending (fail closed).
     # An uncommitted tail from a prior create_review_event_file call makes
-    # this raise, blocking further creation until the tail is committed.
+    # this raise, blocking further construction until the tail is committed.
     committed = validate_review_event_chain(task_dir)
 
     entries = _scan_sequence(directory)
@@ -977,14 +1008,92 @@ def create_review_event_file(
         "details": details,
     }
     event["event_hash"] = _canonical_hash(_event_unsigned_hash_fields(event))
+    return event
 
-    filename = f"{sequence:06d}_{event_id}.json"
+
+def create_review_event_file(
+    task_dir: str,
+    *,
+    event_type: str,
+    reviewer_id: str,
+    reviewer_display_name: str,
+    timestamp_utc: str,
+    reason: str | None = None,
+    manifest_hash_before: str | None = None,
+    manifest_hash_after: str | None = None,
+    details: dict | None = None,
+    event_id: str | None = None,
+) -> dict:
+    """Create the next immutable review-event file without advancing the checkpoint.
+
+    Applies the full existing event validation and construction behavior,
+    then durably creates only the immutable event file (exclusive create,
+    fsync, never overwrite). The new event is an uncommitted tail: chain
+    validation fails closed on it until advance_review_event_checkpoint()
+    commits exactly this event. An existing uncommitted tail blocks further
+    creation (fail closed, no repair or rollback). Never advances the
+    checkpoint, overwrites or deletes events, repairs tails, or rolls back.
+    """
+    event = _construct_next_event(
+        task_dir,
+        create_directory=True,
+        event_type=event_type,
+        reviewer_id=reviewer_id,
+        reviewer_display_name=reviewer_display_name,
+        timestamp_utc=timestamp_utc,
+        reason=reason,
+        manifest_hash_before=manifest_hash_before,
+        manifest_hash_after=manifest_hash_after,
+        details=details,
+        event_id=event_id,
+        event_id_required=False,
+    )
+
+    filename = f"{event['sequence']:06d}_{event['event_id']}.json"
     path = _confined_file_path(task_dir, REVIEW_EVENTS_DIR, filename)
     _atomic_create_exclusive(path, _canonical_bytes(event) + b"\n")
 
     # Deliberately no checkpoint write and no post-creation chain validation:
     # committing the tail is advance_review_event_checkpoint()'s sole job.
     return event
+
+
+def plan_review_event(
+    task_dir: str,
+    *,
+    event_type: str,
+    reviewer_id: str,
+    reviewer_display_name: str,
+    timestamp_utc: str,
+    event_id: str,
+    reason: str | None = None,
+    manifest_hash_before: str | None = None,
+    manifest_hash_after: str | None = None,
+    details: dict | None = None,
+) -> dict:
+    """Plan the exact next review event deterministically, performing no writes.
+
+    Validates the committed chain and all inputs, computes the exact next
+    sequence, previous hash, complete event record, and event_hash, and
+    returns the planned record. Creates, modifies, or deletes no file,
+    directory, or checkpoint. The caller freezes event_id before planning.
+    Shares the same internal event-construction logic as
+    create_review_event_file() so planner and writer cannot drift.
+    """
+    return _construct_next_event(
+        task_dir,
+        create_directory=False,
+        event_type=event_type,
+        reviewer_id=reviewer_id,
+        reviewer_display_name=reviewer_display_name,
+        timestamp_utc=timestamp_utc,
+        reason=reason,
+        manifest_hash_before=manifest_hash_before,
+        manifest_hash_after=manifest_hash_after,
+        details=details,
+        event_id=event_id,
+        event_id_required=True,
+    )
 
 
 def advance_review_event_checkpoint(
@@ -1522,6 +1631,189 @@ def receipt_chain_head_hash(task_dir: str) -> str:
 # ---------------------------------------------------------------------------
 # Uncommitted-tail recovery (explicit, low-level; no CLI command yet)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Standalone transaction recovery receipts (Phase 1B.3C.2B.2C)
+# ---------------------------------------------------------------------------
+# Exactly one immutable receipt per resumed transaction, stored outside the
+# review-event chain at
+# review-recovery/transaction-resumed-<transaction_id>.json. The sanitized
+# transaction_id determines the filename; the path must remain inside the
+# task directory. Receipts are canonical UTF-8 JSON, created exclusively
+# (never overwritten), flushed/fsynced, and self-hash verified.
+
+REVIEW_RECOVERY_DIR = "review-recovery"
+
+RECOVERY_RECEIPT_TYPE = "TRANSACTION_RESUMED"
+
+# Required recovery-receipt fields, in the approved schema order. Unknown
+# fields are rejected; receipt_hash is the canonical self-hash over every
+# other field.
+_RECOVERY_RECEIPT_REQUIRED_FIELDS = (
+    "schema_version",
+    "receipt_type",
+    "transaction_id",
+    "interrupted_stage",
+    "resuming_reviewer_id",
+    "resuming_reviewer_display_name",
+    "reason",
+    "resumed_at_utc",
+    "resulting_manifest_hash",
+    "resulting_audit_chain_head",
+    "receipt_hash",
+)
+
+
+def _recovery_receipt_unsigned_fields(receipt: dict) -> dict:
+    """Return the receipt fields covered by receipt_hash (everything but it)."""
+    return {k: v for k, v in receipt.items() if k != "receipt_hash"}
+
+
+def _recovery_receipt_path(task_dir: str, transaction_id: str) -> str:
+    """Resolve the confined recovery-receipt path for a transaction id.
+
+    The 32-hex transaction_id fully determines the filename; anything else
+    (including traversal or path separators) fails closed before any path
+    is built, so the resolved path can never escape the task directory.
+    """
+    if not isinstance(transaction_id, str) or not re.fullmatch(
+        r"[0-9a-f]{32}", transaction_id
+    ):
+        raise ReviewIntegrityError(
+            "transaction_id must be a 32-char lowercase hex string"
+        )
+    base = _resolve_task_dir(task_dir)
+    directory = _sub_dir(base, REVIEW_RECOVERY_DIR, create=False)
+    filename = f"transaction-resumed-{transaction_id}.json"
+    path = os.path.realpath(os.path.join(directory, filename))
+    if os.path.commonpath([base, path]) != base:
+        raise ReviewIntegrityError(
+            "recovery-receipt path escapes the task directory"
+        )
+    return path
+
+
+def _validate_recovery_receipt_fields(receipt: dict) -> None:
+    """Validate every recovery-receipt field value (not the self-hash)."""
+    if receipt["schema_version"] != SCHEMA_VERSION:
+        raise ReviewIntegrityError(
+            f"recovery receipt has unsupported schema_version: "
+            f"{receipt['schema_version']!r}"
+        )
+    if receipt["receipt_type"] != RECOVERY_RECEIPT_TYPE:
+        raise ReviewIntegrityError(
+            f"recovery receipt has unknown receipt_type: "
+            f"{receipt['receipt_type']!r}"
+        )
+    transaction_id = receipt["transaction_id"]
+    if not isinstance(transaction_id, str) or not re.fullmatch(
+        r"[0-9a-f]{32}", transaction_id
+    ):
+        raise ReviewIntegrityError(
+            "recovery receipt transaction_id must be a 32-char lowercase "
+            "hex string"
+        )
+    if receipt["interrupted_stage"] not in TRANSACTION_STAGES:
+        raise ReviewIntegrityError(
+            f"recovery receipt has unknown interrupted_stage: "
+            f"{receipt['interrupted_stage']!r}"
+        )
+    _validate_reviewer(
+        receipt["resuming_reviewer_id"], receipt["resuming_reviewer_display_name"]
+    )
+    if not isinstance(receipt["reason"], str) or not receipt["reason"].strip():
+        raise ReviewIntegrityError(
+            "recovery receipt reason must be a non-empty string"
+        )
+    _validate_timestamp(receipt["resumed_at_utc"], "recovery_receipt.resumed_at_utc")
+    for field in ("resulting_manifest_hash", "resulting_audit_chain_head"):
+        value = receipt[field]
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ReviewIntegrityError(
+                f"recovery receipt {field} must be a SHA-256 hex digest"
+            )
+
+
+def _validate_recovery_receipt_structure(receipt: dict) -> None:
+    """Validate recovery-receipt fields and self-hash. Fails closed."""
+    for field in _RECOVERY_RECEIPT_REQUIRED_FIELDS:
+        if field not in receipt:
+            raise ReviewIntegrityError(
+                f"recovery receipt missing field: {field}"
+            )
+    unknown = set(receipt) - set(_RECOVERY_RECEIPT_REQUIRED_FIELDS)
+    if unknown:
+        raise ReviewIntegrityError(
+            f"recovery receipt has unknown field(s): {sorted(unknown)!r}"
+        )
+    _validate_recovery_receipt_fields(receipt)
+    recomputed = _canonical_hash(_recovery_receipt_unsigned_fields(receipt))
+    if recomputed != receipt["receipt_hash"]:
+        raise ReviewIntegrityError(
+            "recovery receipt modified: receipt_hash mismatch"
+        )
+
+
+def create_recovery_receipt(
+    task_dir: str,
+    *,
+    transaction_id: str,
+    interrupted_stage: str,
+    resuming_reviewer_id: str,
+    resuming_reviewer_display_name: str,
+    reason: str,
+    resumed_at_utc: str,
+    resulting_manifest_hash: str,
+    resulting_audit_chain_head: str,
+) -> dict:
+    """Create the standalone immutable recovery receipt for a transaction.
+
+    Canonical UTF-8 JSON, created exclusively (never overwritten),
+    flushed/fsynced, and self-hash verified. An existing receipt for the
+    same transaction_id fails closed without modification; verify an
+    exact existing receipt through read_recovery_receipt() — the receipt
+    is never rewritten.
+    """
+    receipt = {
+        "schema_version": SCHEMA_VERSION,
+        "receipt_type": RECOVERY_RECEIPT_TYPE,
+        "transaction_id": transaction_id,
+        "interrupted_stage": interrupted_stage,
+        "resuming_reviewer_id": resuming_reviewer_id,
+        "resuming_reviewer_display_name": resuming_reviewer_display_name,
+        "reason": reason,
+        "resumed_at_utc": resumed_at_utc,
+        "resulting_manifest_hash": resulting_manifest_hash,
+        "resulting_audit_chain_head": resulting_audit_chain_head,
+    }
+    _validate_recovery_receipt_fields(receipt)
+    path = _recovery_receipt_path(task_dir, transaction_id)
+    receipt["receipt_hash"] = _canonical_hash(
+        _recovery_receipt_unsigned_fields(receipt)
+    )
+    # Create the directory only after every input has validated.
+    _sub_dir(task_dir, REVIEW_RECOVERY_DIR)
+    _atomic_create_exclusive(path, _canonical_bytes(receipt) + b"\n")
+    return receipt
+
+
+def read_recovery_receipt(task_dir: str, *, transaction_id: str) -> dict | None:
+    """Read and validate a recovery receipt, or None when absent.
+
+    A malformed, hash-mismatched, or identity-mismatched receipt raises
+    ReviewIntegrityError (fail closed). Never rewrites the receipt.
+    """
+    path = _recovery_receipt_path(task_dir, transaction_id)
+    if not os.path.exists(path):
+        return None
+    receipt = _read_json_file(path, "recovery receipt")
+    _validate_recovery_receipt_structure(receipt)
+    if receipt["transaction_id"] != transaction_id:
+        raise ReviewIntegrityError(
+            "recovery receipt transaction_id does not match the receipt path"
+        )
+    return receipt
 
 
 def find_uncommitted_tail(task_dir: str, chain_type: str) -> list[tuple[int, str]]:
