@@ -209,30 +209,71 @@ could roll back both the chain and its checkpoint together. Digital
 signatures and external anchoring are deferred; **no cryptographic
 tamper-proofing is claimed.**
 
-No operator CLI commands (approve/revoke/audit/recover-lock) are exposed
-yet.
+### Split event/checkpoint primitives (Phase 1B.3C.2B.2B)
+
+Event-file creation and checkpoint advancement are separately controlled
+primitives:
+
+- `create_review_event_file(...)` validates the committed chain and creates
+  only the immutable next event file (exclusive create, fsync, never
+  overwritten). It never advances the checkpoint: the new event is an
+  uncommitted tail that fails closed on committed-chain validation and
+  blocks further event-file creation until it is committed.
+- `advance_review_event_checkpoint(task_dir, *, sequence, event_id,
+  event_hash)` commits exactly one expected tail. Before any checkpoint
+  write it fully validates the existing checkpoint (structure and
+  self-hash), the complete committed event prefix, and the candidate
+  tail's full event structure and semantics, and requires the referenced
+  event to be the sole next-sequence tail beyond the checkpoint. Only
+  then is the checkpoint atomically advanced, and the resulting committed
+  chain is fully validated again. A rejected advance never mutates the
+  checkpoint; event files are never created, modified, rewritten, or
+  deleted.
+- `create_review_event(...)` keeps its pre-split signature and observable
+  behavior by composing the two primitives: create the immutable event
+  file, then advance the checkpoint to it.
+
+Read-only `status` and `audit` CLI commands are available (Phase
+1B.3C.2B.1). Mutating review commands (verify-claim, retract-claim,
+resume-transaction) are deferred to Phase 1B.3C.2B.2C;
+approve/revoke/recover-lock/tail-recovery remain unexposed.
 
 ## Transaction journal (Phase 1B.3C.2B.2B)
 
 `review-transaction.json` — an atomic, hash-verified journal for multi-step
 review transactions (verify-claim, retract-claim). The journal records
-`schema_version`, `transaction_id`, `operation`, `starting_manifest_hash`,
-`proposed_manifest_hash`, `reviewer_id`, `reviewer_display_name`, `claim_id`,
-`transaction_stage`, `created_at_utc`, `lock_token`, and `journal_hash`.
+exactly these 17 fields: `schema_version`, `transaction_id`, `operation`,
+`task_id`, `claim_id`, `starting_manifest_hash`, `proposed_manifest_hash`,
+`proposed_manifest_relative_path`, `snapshot_relative_path`,
+`expected_event_id`, `expected_event_hash`, `lock_token`,
+`transaction_stage`, `created_at_utc`, `original_reviewer_id`,
+`original_reviewer_display_name`, and `journal_hash`. Missing or unknown
+fields fail closed.
 
-Stages: `INITIATED` → `LOCK_ACQUIRED` → `SNAPSHOT_CREATED` → `EVENT_CREATED`
-→ `CHECKPOINT_UPDATED` → `MANIFEST_WRITTEN` → `COMMITTED`.
+Stages (exactly eight, forward-only):
+
+```
+INITIATED → LOCK_ACQUIRED → SNAPSHOT_CREATED → PROPOSED_MANIFEST_READY →
+EVENT_CREATED → CHECKPOINT_UPDATED → MANIFEST_INSTALLED → COMMITTED
+```
 
 Rules:
 - Creation is atomic and exclusive; an existing journal blocks creation.
-- Stage updates are forward-only and verified against immutable fields.
+- Stage updates advance only to the immediately following stage; skips,
+  repeats, and reversals are rejected.
+- Only `transaction_stage` (and the derived `journal_hash`) may change
+  through the update primitive; every other field is immutable.
 - A malformed or hash-mismatched journal fails closed on read.
-- `status` and `audit` always show transaction status: `none` when no journal
-  exists, `INCOMPLETE_TRANSACTION` (with stage/operation/claim_id) when a
-  journal exists or is malformed.
+- `status` always reports transaction status: `transaction status: none`
+  when no journal exists. When any journal exists — valid or malformed —
+  `status` prints only `transaction status: INCOMPLETE_TRANSACTION`, a
+  sanitized `transaction id` (or `invalid`), and a validated known
+  `transaction stage` (or `invalid`), then exits 1. Operation, claim IDs,
+  reasons, tokens, and parser details are never printed.
+- `audit` reports reason code `INCOMPLETE_TRANSACTION` and exits 1 without
+  exposing journal contents.
 - `status` and `audit` remain byte-for-byte read-only; they never create,
   modify, or delete the journal.
-- A valid or malformed journal produces `INCOMPLETE_TRANSACTION` and exit 1.
 
 No claim mutation or transaction execution commands are exposed yet.
 

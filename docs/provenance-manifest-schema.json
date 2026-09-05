@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://braintrustcrypto.local/schemas/provenance-manifest.schema.json",
   "title": "BrainTrustCrypto Provenance Manifest",
-  "description": "Offline provenance and human-review manifest (Phase 1B.3A/1B.3C.2A/1B.3C.2B.2B), schema 1.2.0. Every new manifest defaults to NEEDS_HUMAN_REVIEW. Secrets, credentials, and full sensitive prompts are never recorded; only prompt hashes are stored. Existing 1.0.0 and 1.1.0 manifests remain valid and are only upgraded through explicit migration functions; they are never silently reinterpreted or overwritten. Schema 1.2.0 adds immutable claim_id for every factual claim.",
+  "description": "Offline provenance and human-review manifest (Phase 1B.3A/1B.3C.2A/1B.3C.2B.2B), schema 1.2.0. Every new manifest defaults to NEEDS_HUMAN_REVIEW. Secrets, credentials, and full sensitive prompts are never recorded; only prompt hashes are stored. Existing 1.0.0 and 1.1.0 manifests remain valid and are only upgraded through explicit migration functions; they are never silently reinterpreted or overwritten. Schema 1.2.0 adds immutable claim_id for every factual claim; claim_id is conditionally required (and non-null) only when task.schema_version is 1.2.0 — 1.0.0 and 1.1.0 manifests remain valid without it.",
   "type": "object",
   "additionalProperties": false,
   "required": ["task", "script", "assets", "factual_claims", "ai_generations", "output"],
@@ -59,9 +59,9 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["claim_id", "claim_text", "source_url", "source_publication_date", "retrieval_date", "status", "reviewer", "review_date", "supporting_sources", "reviewer_id", "reviewer_display_name", "review_timestamp_utc", "notes"],
+        "required": ["claim_text", "source_url", "source_publication_date", "retrieval_date", "status", "reviewer", "review_date", "supporting_sources", "reviewer_id", "reviewer_display_name", "review_timestamp_utc", "notes"],
         "properties": {
-          "claim_id": { "type": ["string", "null"], "pattern": "^claim-[0-9a-f]{32}$", "description": "Schema 1.2.0: immutable claim identifier derived from SHA-256 of canonical JSON (task_id, ordinal, normalized claim_text, source_url); required for 1.2.0 manifests" },
+          "claim_id": { "type": ["string", "null"], "pattern": "^claim-[0-9a-f]{32}$", "description": "Immutable claim identifier derived from SHA-256 of canonical JSON (task_id, ordinal, normalized claim_text, source_url). Required and non-null for schema 1.2.0 via the top-level allOf conditional below; optional and nullable for legacy 1.0.0/1.1.0 manifests (a present string must still match the pattern). Uniqueness within the manifest is enforced by Python validation; JSON Schema cannot express array uniqueness." },
           "claim_text": { "type": "string", "minLength": 1 },
           "source_url": { "type": "string", "minLength": 1, "description": "May satisfy the VERIFIED supporting-HTTPS-URL requirement" },
           "source_publication_date": { "type": ["string", "null"] },
@@ -105,5 +105,33 @@
         "visible_watermark_required": { "type": "boolean", "const": false }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "description": "Version-conditional claim_id: schema 1.2.0 requires a non-null claim_id matching ^claim-[0-9a-f]{32}$ for every factual claim; legacy 1.0.0/1.1.0 manifests are unaffected and remain valid without claim_id",
+      "if": {
+        "properties": {
+          "task": {
+            "properties": {
+              "schema_version": { "const": "1.2.0" }
+            },
+            "required": ["schema_version"]
+          }
+        },
+        "required": ["task"]
+      },
+      "then": {
+        "properties": {
+          "factual_claims": {
+            "items": {
+              "required": ["claim_id"],
+              "properties": {
+                "claim_id": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

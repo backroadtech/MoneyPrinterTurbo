@@ -39,6 +39,9 @@ Guarantees:
 - Read-only: no file in the task directory is created or changed.
 - Sanitized output: never prints complete claim text, prompts, secrets,
   credentials, authorization data, query strings, or environment values.
+- Transaction status is always reported (`transaction status: none` or
+  `INCOMPLETE_TRANSACTION` with only a sanitized transaction id and a
+  validated known stage) without exposing journal contents.
 - Makes no network request and invokes no provider, renderer, or publisher.
 """
 
@@ -48,6 +51,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 
 EXIT_OK = 0
@@ -491,20 +495,30 @@ def cmd_status(args: argparse.Namespace) -> int:
     for reason in ready_reasons:
         print(f"    - {_truncate(reason)}")
 
-    # Transaction journal status (read-only).
+    # Transaction journal status (read-only). Prints only the sanitized
+    # transaction id and a validated known stage — never the operation,
+    # claim ids, reasons, tokens, parser details, or other journal data.
+    from app.services import review_integrity as ri
+
     journal = state.get("transaction_journal")
     journal_error = state.get("transaction_journal_error")
     if journal is None and journal_error is None:
-        print("  transaction status:   none")
+        print("  transaction status: none")
     else:
-        print(f"  transaction status:   INCOMPLETE_TRANSACTION")
+        transaction_id = "invalid"
+        transaction_stage = "invalid"
         if journal is not None:
-            print(f"    stage:              {journal.get('transaction_stage')}")
-            print(f"    operation:          {journal.get('operation')}")
-            print(f"    claim_id:           {journal.get('claim_id')}")
-            print(f"    transaction_id:     {journal.get('transaction_id')}")
-        else:
-            print(f"    error:              {_truncate(journal_error)}")
+            candidate_id = journal.get("transaction_id")
+            if isinstance(candidate_id, str) and re.fullmatch(
+                r"[0-9a-f]{32}", candidate_id
+            ):
+                transaction_id = candidate_id
+            candidate_stage = journal.get("transaction_stage")
+            if candidate_stage in ri.TRANSACTION_STAGES:
+                transaction_stage = candidate_stage
+        print("  transaction status: INCOMPLETE_TRANSACTION")
+        print(f"  transaction id: {transaction_id}")
+        print(f"  transaction stage: {transaction_stage}")
 
     if hard_failure:
         return EXIT_FAILURE

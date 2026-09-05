@@ -27,6 +27,9 @@ Fully offline tests (zero network access). Covers:
 - TRANSACTION_RESUMED rejection (fail closed)
 - split event-file creation and checkpoint advancement primitives
 - no checkpoint mutation on rejected advancement (fail-closed pre-write)
+- version-conditional JSON Schema document assertions (1.2.0 requires
+  non-null claim_id; legacy manifests remain valid without it)
+- exact transaction-status output, safe placeholders, and redaction
 - split-boundary independent failure detection and recovery
 - no network access
 """
@@ -373,6 +376,53 @@ class TestSchema120(_TaskDirBase):
                         "reviewer_display_name", "review_timestamp_utc", "notes"):
                 claim.pop(key, None)
         prov.validate_manifest(manifest)  # must not raise
+
+    def test_1_2_0_missing_claim_id_key_rejected(self):
+        claim = prov.build_claim(
+            claim_text="c", source_url="https://x.com/y",
+            claim_id=prov.generate_claim_id(
+                task_id="task-001", ordinal=0,
+                claim_text="c", source_url="https://x.com/y",
+            ),
+        )
+        manifest = self.simple_manifest([claim])
+        del manifest["factual_claims"][0]["claim_id"]
+        with self.assertRaises(prov.ProvenanceError):
+            prov.validate_manifest(manifest)
+
+    def test_1_2_0_null_and_malformed_claim_id_rejected(self):
+        claim = prov.build_claim(
+            claim_text="c", source_url="https://x.com/y",
+            claim_id=prov.generate_claim_id(
+                task_id="task-001", ordinal=0,
+                claim_text="c", source_url="https://x.com/y",
+            ),
+        )
+        manifest = self.simple_manifest([claim])
+        for bad in (None, "invalid", "claim-" + "A" * 32, "claim-" + "a" * 31):
+            manifest["factual_claims"][0]["claim_id"] = bad
+            with self.assertRaises(prov.ProvenanceError):
+                prov.validate_manifest(manifest)
+
+    def test_legacy_null_or_absent_claim_id_preserved(self):
+        claim = prov.build_claim(
+            claim_text="c", source_url="https://x.com/y",
+            claim_id=prov.generate_claim_id(
+                task_id="task-001", ordinal=0,
+                claim_text="c", source_url="https://x.com/y",
+            ),
+        )
+        manifest = self.simple_manifest([claim])
+        manifest["task"]["schema_version"] = "1.1.0"
+        manifest["factual_claims"][0]["claim_id"] = None
+        prov.validate_manifest(manifest)  # null tolerated for legacy
+        del manifest["factual_claims"][0]["claim_id"]
+        prov.validate_manifest(manifest)  # absent tolerated for legacy
+        manifest["task"]["schema_version"] = "1.0.0"
+        for key in ("supporting_sources", "reviewer_id",
+                    "reviewer_display_name", "review_timestamp_utc", "notes"):
+            manifest["factual_claims"][0].pop(key, None)
+        prov.validate_manifest(manifest)  # 1.0.0 stays valid without claim_id
 
 
 # ---------------------------------------------------------------------------
@@ -847,6 +897,79 @@ class TestTransactionResumedRejected(_TaskDirBase):
             handle.write(ri._canonical_bytes(forged) + b"\n")
         with self.assertRaises(ri.ReviewIntegrityError):
             ri.validate_review_event_chain(self.task_dir)
+
+
+# ---------------------------------------------------------------------------
+# Version-conditional JSON Schema document assertions
+# ---------------------------------------------------------------------------
+
+
+SCHEMA_DOC_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "docs"
+    / "provenance-manifest-schema.json"
+)
+
+
+class TestJsonSchemaVersionConditional(_TaskDirBase):
+    """Pin the exact version-conditional claim_id encoding in the schema doc.
+
+    Structural assertions only — no general-purpose JSON Schema evaluator.
+    Proves schema 1.2.0 conditionally requires a non-null claim_id matching
+    ^claim-[0-9a-f]{32}$ while legacy 1.0.0/1.1.0 manifests remain valid
+    without it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(SCHEMA_DOC_PATH, encoding="utf-8") as handle:
+            cls.schema = json.load(handle)
+
+    def _claim_items(self):
+        return self.schema["properties"]["factual_claims"]["items"]
+
+    def _conditional(self):
+        blocks = self.schema.get("allOf")
+        self.assertIsInstance(blocks, list)
+        self.assertEqual(len(blocks), 1)
+        return blocks[0]
+
+    def test_claim_id_not_unconditionally_required(self):
+        required = self._claim_items()["required"]
+        self.assertNotIn("claim_id", required)
+        for field in ("claim_text", "source_url", "status"):
+            self.assertIn(field, required)
+
+    def test_claim_id_base_property_nullable_with_pattern(self):
+        claim_id = self._claim_items()["properties"]["claim_id"]
+        self.assertEqual(claim_id["type"], ["string", "null"])
+        self.assertEqual(claim_id["pattern"], "^claim-[0-9a-f]{32}$")
+
+    def test_conditional_if_targets_schema_1_2_0(self):
+        condition = self._conditional()["if"]
+        self.assertEqual(condition["required"], ["task"])
+        task = condition["properties"]["task"]
+        self.assertEqual(task["required"], ["schema_version"])
+        self.assertEqual(task["properties"]["schema_version"], {"const": "1.2.0"})
+
+    def test_conditional_then_requires_non_null_claim_id(self):
+        then = self._conditional()["then"]
+        items = then["properties"]["factual_claims"]["items"]
+        self.assertIn("claim_id", items["required"])
+        # Non-null override: under 1.2.0 the type narrows to string only.
+        self.assertEqual(items["properties"]["claim_id"]["type"], "string")
+
+    def test_schema_version_enum_covers_all_supported(self):
+        enum = self.schema["properties"]["task"]["properties"]["schema_version"][
+            "enum"
+        ]
+        for version in ("1.2.0", "1.1.0", "1.0.0"):
+            self.assertIn(version, enum)
+
+    def test_uniqueness_documented_as_python_enforced(self):
+        description = self._claim_items()["properties"]["claim_id"]["description"]
+        self.assertIn("uniqueness", description.lower())
+        self.assertIn("python", description.lower())
 
 
 # ---------------------------------------------------------------------------
@@ -1524,20 +1647,48 @@ class TestReadOnlyCliDetection(unittest.TestCase):
     def test_status_with_no_journal(self):
         code, out, _ = self._run_cli("status")
         self.assertEqual(code, 0)
-        self.assertIn("transaction status:   none", out)
+        self.assertIn("  transaction status: none\n", out)
+        self.assertNotIn("INCOMPLETE_TRANSACTION", out)
 
     def test_status_with_valid_journal(self):
-        ri.create_transaction_journal(self.task_dir, **JOURNAL_KWARGS)
+        journal = ri.create_transaction_journal(self.task_dir, **JOURNAL_KWARGS)
         code, out, _ = self._run_cli("status")
         self.assertEqual(code, 1)
-        self.assertIn("INCOMPLETE_TRANSACTION", out)
+        block = (
+            "  transaction status: INCOMPLETE_TRANSACTION\n"
+            f"  transaction id: {journal['transaction_id']}\n"
+            "  transaction stage: INITIATED\n"
+        )
+        self.assertIn(block, out)
 
     def test_status_with_malformed_journal(self):
         with open(os.path.join(self.task_dir, "review-transaction.json"), "w") as h:
             h.write("{corrupt")
         code, out, _ = self._run_cli("status")
         self.assertEqual(code, 1)
-        self.assertIn("INCOMPLETE_TRANSACTION", out)
+        block = (
+            "  transaction status: INCOMPLETE_TRANSACTION\n"
+            "  transaction id: invalid\n"
+            "  transaction stage: invalid\n"
+        )
+        self.assertIn(block, out)
+        self.assertNotIn("{corrupt", out)
+
+    def test_status_transaction_output_redaction(self):
+        ri.create_transaction_journal(self.task_dir, **JOURNAL_KWARGS)
+        code, out, _ = self._run_cli("status")
+        self.assertEqual(code, 1)
+        for leaked in (
+            JOURNAL_KWARGS["claim_id"],
+            JOURNAL_KWARGS["lock_token"],
+            JOURNAL_KWARGS["expected_event_id"],
+            JOURNAL_KWARGS["expected_event_hash"],
+            JOURNAL_KWARGS["starting_manifest_hash"],
+            JOURNAL_KWARGS["proposed_manifest_hash"],
+            "verify-claim",
+            "operation",
+        ):
+            self.assertNotIn(leaked, out)
 
     def test_audit_with_no_journal(self):
         code, out, _ = self._run_cli("audit")
@@ -1545,11 +1696,14 @@ class TestReadOnlyCliDetection(unittest.TestCase):
         self.assertIn("PASS", out)
 
     def test_audit_with_valid_journal(self):
-        ri.create_transaction_journal(self.task_dir, **JOURNAL_KWARGS)
+        journal = ri.create_transaction_journal(self.task_dir, **JOURNAL_KWARGS)
         code, out, _ = self._run_cli("audit")
         self.assertEqual(code, 1)
         self.assertIn("FAIL", out)
         self.assertIn("INCOMPLETE_TRANSACTION", out)
+        self.assertNotIn(journal["transaction_id"], out)
+        self.assertNotIn(JOURNAL_KWARGS["claim_id"], out)
+        self.assertNotIn(JOURNAL_KWARGS["lock_token"], out)
 
     def test_audit_with_malformed_journal(self):
         with open(os.path.join(self.task_dir, "review-transaction.json"), "w") as h:
