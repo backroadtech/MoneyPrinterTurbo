@@ -24,6 +24,10 @@ Fully offline tests (zero network access). Covers:
 - status/audit with no journal
 - status/audit with valid, malformed, or modified journal
 - read-only byte-for-byte guarantees
+- TRANSACTION_RESUMED rejection (fail closed)
+- split event-file creation and checkpoint advancement primitives
+- no checkpoint mutation on rejected advancement (fail-closed pre-write)
+- split-boundary independent failure detection and recovery
 - no network access
 """
 
@@ -776,25 +780,617 @@ class TestTransactionJournal(_TaskDirBase):
 
 
 # ---------------------------------------------------------------------------
-# TRANSACTION_RESUMED event type
+# TRANSACTION_RESUMED rejection (fail closed; resume evidence is a receipt)
 # ---------------------------------------------------------------------------
 
 
-class TestTransactionResumedEvent(_TaskDirBase):
-    def test_transaction_resumed_event_type_recognized(self):
-        self.assertIn("TRANSACTION_RESUMED", ri.EVENT_TYPES)
+class TestTransactionResumedRejected(_TaskDirBase):
+    def test_transaction_resumed_not_in_event_types(self):
+        self.assertNotIn("TRANSACTION_RESUMED", ri.EVENT_TYPES)
 
-    def test_create_transaction_resumed_event(self):
-        event = ri.create_review_event(
+    def test_create_transaction_resumed_event_rejected(self):
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.create_review_event(
+                self.task_dir,
+                event_type="TRANSACTION_RESUMED",
+                reviewer_id=REVIEWER_ID,
+                reviewer_display_name=REVIEWER_NAME,
+                timestamp_utc=UTC,
+                reason="resuming interrupted transaction",
+                details={"transaction_id": "a" * 32},
+            )
+        events_dir = os.path.join(self.task_dir, "review-events")
+        self.assertEqual(ri._scan_sequence(events_dir), [])
+
+    def test_create_transaction_resumed_event_file_rejected(self):
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.create_review_event_file(
+                self.task_dir,
+                event_type="TRANSACTION_RESUMED",
+                reviewer_id=REVIEWER_ID,
+                reviewer_display_name=REVIEWER_NAME,
+                timestamp_utc=UTC,
+                reason="resuming interrupted transaction",
+                details={"transaction_id": "a" * 32},
+            )
+        events_dir = os.path.join(self.task_dir, "review-events")
+        self.assertEqual(ri._scan_sequence(events_dir), [])
+
+    def test_forged_transaction_resumed_event_fails_chain_validation(self):
+        committed = ri.create_review_event(
             self.task_dir,
-            event_type="TRANSACTION_RESUMED",
+            event_type="CLAIM_VERIFIED",
             reviewer_id=REVIEWER_ID,
             reviewer_display_name=REVIEWER_NAME,
             timestamp_utc=UTC,
-            reason="resuming interrupted transaction",
-            details={"transaction_id": "a" * 32, "stage_at_resume": "LOCK_ACQUIRED"},
         )
-        self.assertEqual(event["event_type"], "TRANSACTION_RESUMED")
+        forged = {
+            "schema_version": ri.SCHEMA_VERSION,
+            "sequence": 2,
+            "event_id": "f" * 32,
+            "event_type": "TRANSACTION_RESUMED",
+            "timestamp_utc": UTC2,
+            "reviewer_id": REVIEWER_ID,
+            "reviewer_display_name": REVIEWER_NAME,
+            "reason": "forged resume evidence",
+            "previous_event_hash": committed["event_hash"],
+            "manifest_hash_before": None,
+            "manifest_hash_after": None,
+            "details": None,
+        }
+        forged["event_hash"] = ri._canonical_hash(
+            ri._event_unsigned_hash_fields(forged)
+        )
+        events_dir = os.path.join(self.task_dir, "review-events")
+        path = os.path.join(events_dir, "000002_" + "f" * 32 + ".json")
+        with open(path, "wb") as handle:
+            handle.write(ri._canonical_bytes(forged) + b"\n")
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.validate_review_event_chain(self.task_dir)
+
+
+# ---------------------------------------------------------------------------
+# Split event-file creation / checkpoint advancement primitives
+# ---------------------------------------------------------------------------
+
+
+class TestCreateReviewEventFile(_TaskDirBase):
+    def _create_file(self, **overrides):
+        kwargs = dict(
+            event_type="CLAIM_VERIFIED",
+            reviewer_id=REVIEWER_ID,
+            reviewer_display_name=REVIEWER_NAME,
+            timestamp_utc=UTC,
+        )
+        kwargs.update(overrides)
+        return ri.create_review_event_file(self.task_dir, **kwargs)
+
+    def test_creates_event_file_without_advancing_checkpoint(self):
+        event = self._create_file()
+        events_dir = os.path.join(self.task_dir, "review-events")
+        entries = ri._scan_sequence(events_dir)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(event["sequence"], 1)
+        self.assertIsNone(ri._read_checkpoint(events_dir))
+        # The uncommitted tail fails closed on committed-chain validation.
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.validate_review_event_chain(self.task_dir)
+
+    def test_caller_supplied_event_id_used(self):
+        event = self._create_file(event_id="d" * 32)
+        self.assertEqual(event["event_id"], "d" * 32)
+        events_dir = os.path.join(self.task_dir, "review-events")
+        entries = ri._scan_sequence(events_dir)
+        self.assertEqual(entries[0][1], "000001_" + "d" * 32 + ".json")
+
+    def test_invalid_event_id_rejected(self):
+        for bad_id in ("not-hex", "D" * 32, "d" * 31, "d" * 33, 123):
+            with self.assertRaises(ri.ReviewIntegrityError):
+                self._create_file(event_id=bad_id)
+        events_dir = os.path.join(self.task_dir, "review-events")
+        self.assertEqual(ri._scan_sequence(events_dir), [])
+
+    def test_event_validation_preserved(self):
+        with self.assertRaises(ri.ReviewIntegrityError):
+            self._create_file(event_type="NO_SUCH_TYPE")
+        with self.assertRaises(ri.ReviewIntegrityError):
+            self._create_file(event_type="CLAIM_RETRACTED")  # reason required
+        with self.assertRaises(ri.ReviewIntegrityError):
+            self._create_file(manifest_hash_before="not-a-hash")
+        events_dir = os.path.join(self.task_dir, "review-events")
+        self.assertEqual(ri._scan_sequence(events_dir), [])
+
+    def test_duplicate_committed_event_id_rejected(self):
+        first = self._create_file(event_id="d" * 32)
+        ri.advance_review_event_checkpoint(
+            self.task_dir,
+            sequence=first["sequence"],
+            event_id=first["event_id"],
+            event_hash=first["event_hash"],
+        )
+        with self.assertRaises(ri.ReviewIntegrityError):
+            self._create_file(event_id="d" * 32)
+        events = ri.validate_review_event_chain(self.task_dir)
+        self.assertEqual(len(events), 1)
+
+    def test_uncommitted_tail_blocks_second_file(self):
+        self._create_file()
+        with self.assertRaises(ri.ReviewIntegrityError):
+            self._create_file()
+        events_dir = os.path.join(self.task_dir, "review-events")
+        self.assertEqual(len(ri._scan_sequence(events_dir)), 1)
+
+    def test_retry_same_event_id_does_not_overwrite(self):
+        self._create_file(event_id="d" * 32)
+        events_dir = os.path.join(self.task_dir, "review-events")
+        path = os.path.join(events_dir, "000001_" + "d" * 32 + ".json")
+        with open(path, "rb") as handle:
+            before = handle.read()
+        with self.assertRaises(ri.ReviewIntegrityError):
+            self._create_file(event_id="d" * 32)
+        with open(path, "rb") as handle:
+            after = handle.read()
+        self.assertEqual(before, after)
+
+
+class TestAdvanceReviewEventCheckpoint(_TaskDirBase):
+    def _create_tail(self, **overrides):
+        kwargs = dict(
+            event_type="CLAIM_VERIFIED",
+            reviewer_id=REVIEWER_ID,
+            reviewer_display_name=REVIEWER_NAME,
+            timestamp_utc=UTC,
+        )
+        kwargs.update(overrides)
+        return ri.create_review_event_file(self.task_dir, **kwargs)
+
+    def test_advances_to_exact_tail(self):
+        event = self._create_tail(event_id="d" * 32)
+        checkpoint = ri.advance_review_event_checkpoint(
+            self.task_dir,
+            sequence=event["sequence"],
+            event_id=event["event_id"],
+            event_hash=event["event_hash"],
+        )
+        self.assertEqual(checkpoint["last_sequence"], 1)
+        self.assertEqual(checkpoint["last_record_id"], event["event_id"])
+        self.assertEqual(checkpoint["last_record_hash"], event["event_hash"])
+        self.assertEqual(checkpoint["chain_type"], "review-events")
+        recomputed = ri._canonical_hash(ri._checkpoint_unsigned_fields(checkpoint))
+        self.assertEqual(checkpoint["checkpoint_hash"], recomputed)
+        events = ri.validate_review_event_chain(self.task_dir)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_id"], event["event_id"])
+
+    def test_no_events_refused(self):
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.advance_review_event_checkpoint(
+                self.task_dir,
+                sequence=1,
+                event_id="d" * 32,
+                event_hash=HASH_A,
+            )
+
+    def test_no_tail_refused_checkpoint_unchanged(self):
+        event = self._create_tail()
+        ri.advance_review_event_checkpoint(
+            self.task_dir,
+            sequence=event["sequence"],
+            event_id=event["event_id"],
+            event_hash=event["event_hash"],
+        )
+        events_dir = os.path.join(self.task_dir, "review-events")
+        checkpoint_path = os.path.join(events_dir, "chain-head.json")
+        with open(checkpoint_path, "rb") as handle:
+            before = handle.read()
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.advance_review_event_checkpoint(
+                self.task_dir,
+                sequence=event["sequence"],
+                event_id=event["event_id"],
+                event_hash=event["event_hash"],
+            )
+        with open(checkpoint_path, "rb") as handle:
+            after = handle.read()
+        self.assertEqual(before, after)
+
+    def test_wrong_event_id_refused(self):
+        event = self._create_tail(event_id="d" * 32)
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.advance_review_event_checkpoint(
+                self.task_dir,
+                sequence=event["sequence"],
+                event_id="e" * 32,
+                event_hash=event["event_hash"],
+            )
+        events_dir = os.path.join(self.task_dir, "review-events")
+        self.assertIsNone(ri._read_checkpoint(events_dir))
+
+    def test_wrong_event_hash_refused(self):
+        event = self._create_tail(event_id="d" * 32)
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.advance_review_event_checkpoint(
+                self.task_dir,
+                sequence=event["sequence"],
+                event_id=event["event_id"],
+                event_hash=HASH_B,
+            )
+        events_dir = os.path.join(self.task_dir, "review-events")
+        self.assertIsNone(ri._read_checkpoint(events_dir))
+
+    def test_wrong_sequence_refused(self):
+        event = self._create_tail(event_id="d" * 32)
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.advance_review_event_checkpoint(
+                self.task_dir,
+                sequence=event["sequence"] + 1,
+                event_id=event["event_id"],
+                event_hash=event["event_hash"],
+            )
+        events_dir = os.path.join(self.task_dir, "review-events")
+        self.assertIsNone(ri._read_checkpoint(events_dir))
+
+    def test_invalid_parameters_rejected(self):
+        self._create_tail()
+        bad_calls = (
+            dict(sequence=0, event_id="d" * 32, event_hash=HASH_A),
+            dict(sequence="1", event_id="d" * 32, event_hash=HASH_A),
+            dict(sequence=1, event_id="bad", event_hash=HASH_A),
+            dict(sequence=1, event_id="d" * 32, event_hash="bad"),
+        )
+        for kwargs in bad_calls:
+            with self.assertRaises(ri.ReviewIntegrityError):
+                ri.advance_review_event_checkpoint(self.task_dir, **kwargs)
+        events_dir = os.path.join(self.task_dir, "review-events")
+        self.assertIsNone(ri._read_checkpoint(events_dir))
+
+    def test_tampered_tail_event_fails_closed(self):
+        event = self._create_tail(event_id="d" * 32)
+        events_dir = os.path.join(self.task_dir, "review-events")
+        path = os.path.join(events_dir, "000001_" + "d" * 32 + ".json")
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        data["reason"] = "tampered after creation"
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.advance_review_event_checkpoint(
+                self.task_dir,
+                sequence=event["sequence"],
+                event_id=event["event_id"],
+                event_hash=event["event_hash"],
+            )
+        self.assertIsNone(ri._read_checkpoint(events_dir))
+
+    def test_advance_verifies_previous_event_linkage(self):
+        ri.create_review_event(
+            self.task_dir,
+            event_type="CLAIM_VERIFIED",
+            reviewer_id=REVIEWER_ID,
+            reviewer_display_name=REVIEWER_NAME,
+            timestamp_utc=UTC,
+        )
+        second = self._create_tail(event_id="e" * 32, timestamp_utc=UTC2)
+        events_dir = os.path.join(self.task_dir, "review-events")
+        path = os.path.join(events_dir, "000002_" + "e" * 32 + ".json")
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        data["previous_event_hash"] = HASH_B  # break linkage only
+        data["event_hash"] = ri._canonical_hash(ri._event_unsigned_hash_fields(data))
+        with open(path, "wb") as handle:
+            handle.write(ri._canonical_bytes(data) + b"\n")
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.advance_review_event_checkpoint(
+                self.task_dir,
+                sequence=second["sequence"],
+                event_id=second["event_id"],
+                event_hash=data["event_hash"],
+            )
+        checkpoint = ri._read_checkpoint(events_dir)
+        self.assertEqual(checkpoint["last_sequence"], 1)
+
+    def test_extra_tail_beyond_reference_fails_closed(self):
+        first = self._create_tail(event_id="d" * 32)
+        forged = {
+            "schema_version": ri.SCHEMA_VERSION,
+            "sequence": 2,
+            "event_id": "f" * 32,
+            "event_type": "CLAIM_VERIFIED",
+            "timestamp_utc": UTC2,
+            "reviewer_id": REVIEWER_ID,
+            "reviewer_display_name": REVIEWER_NAME,
+            "reason": None,
+            "previous_event_hash": first["event_hash"],
+            "manifest_hash_before": None,
+            "manifest_hash_after": None,
+            "details": None,
+        }
+        forged["event_hash"] = ri._canonical_hash(
+            ri._event_unsigned_hash_fields(forged)
+        )
+        events_dir = os.path.join(self.task_dir, "review-events")
+        path = os.path.join(events_dir, "000002_" + "f" * 32 + ".json")
+        with open(path, "wb") as handle:
+            handle.write(ri._canonical_bytes(forged) + b"\n")
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.advance_review_event_checkpoint(
+                self.task_dir,
+                sequence=first["sequence"],
+                event_id=first["event_id"],
+                event_hash=first["event_hash"],
+            )
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.advance_review_event_checkpoint(
+                self.task_dir,
+                sequence=forged["sequence"],
+                event_id=forged["event_id"],
+                event_hash=forged["event_hash"],
+            )
+        self.assertIsNone(ri._read_checkpoint(events_dir))
+
+    def test_advance_does_not_modify_event_file(self):
+        event = self._create_tail(event_id="d" * 32)
+        events_dir = os.path.join(self.task_dir, "review-events")
+        path = os.path.join(events_dir, "000001_" + "d" * 32 + ".json")
+        with open(path, "rb") as handle:
+            before = handle.read()
+        ri.advance_review_event_checkpoint(
+            self.task_dir,
+            sequence=event["sequence"],
+            event_id=event["event_id"],
+            event_hash=event["event_hash"],
+        )
+        with open(path, "rb") as handle:
+            after = handle.read()
+        self.assertEqual(before, after)
+
+    def _committed_head(self):
+        return ri.create_review_event(
+            self.task_dir,
+            event_type="CLAIM_VERIFIED",
+            reviewer_id=REVIEWER_ID,
+            reviewer_display_name=REVIEWER_NAME,
+            timestamp_utc=UTC,
+        )
+
+    def _checkpoint_bytes(self):
+        events_dir = os.path.join(self.task_dir, "review-events")
+        with open(os.path.join(events_dir, "chain-head.json"), "rb") as handle:
+            return handle.read()
+
+    def _forge_tail(self, committed, event_id="f" * 32, omit=(), **overrides):
+        forged = {
+            "schema_version": ri.SCHEMA_VERSION,
+            "sequence": committed["sequence"] + 1,
+            "event_id": event_id,
+            "event_type": "CLAIM_VERIFIED",
+            "timestamp_utc": UTC2,
+            "reviewer_id": REVIEWER_ID,
+            "reviewer_display_name": REVIEWER_NAME,
+            "reason": None,
+            "previous_event_hash": committed["event_hash"],
+            "manifest_hash_before": None,
+            "manifest_hash_after": None,
+            "details": None,
+        }
+        forged.update(overrides)
+        for field in omit:
+            del forged[field]
+        # Recompute a matching hash over the (possibly invalid) structure so
+        # rejection must come from structural/semantic validation, not the
+        # self-hash check.
+        forged["event_hash"] = ri._canonical_hash(
+            ri._event_unsigned_hash_fields(forged)
+        )
+        events_dir = os.path.join(self.task_dir, "review-events")
+        name = f"{forged['sequence']:06d}_{event_id}.json"
+        with open(os.path.join(events_dir, name), "wb") as handle:
+            handle.write(ri._canonical_bytes(forged) + b"\n")
+        return forged
+
+    def test_invalid_existing_checkpoint_hash_no_mutation(self):
+        self._committed_head()
+        tail = self._create_tail(event_id="e" * 32, timestamp_utc=UTC2)
+        events_dir = os.path.join(self.task_dir, "review-events")
+        checkpoint_path = os.path.join(events_dir, "chain-head.json")
+        with open(checkpoint_path, encoding="utf-8") as handle:
+            checkpoint = json.load(handle)
+        checkpoint["last_record_id"] = "0" * 32  # invalidates checkpoint_hash
+        with open(checkpoint_path, "w", encoding="utf-8") as handle:
+            json.dump(checkpoint, handle)
+        before = self._checkpoint_bytes()
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.advance_review_event_checkpoint(
+                self.task_dir,
+                sequence=tail["sequence"],
+                event_id=tail["event_id"],
+                event_hash=tail["event_hash"],
+            )
+        self.assertEqual(before, self._checkpoint_bytes())
+        self.assertEqual(ri._read_checkpoint(events_dir)["last_sequence"], 1)
+
+    def test_corrupted_committed_prefix_event_no_mutation(self):
+        committed = self._committed_head()
+        tail = self._create_tail(event_id="e" * 32, timestamp_utc=UTC2)
+        events_dir = os.path.join(self.task_dir, "review-events")
+        committed_path = os.path.join(
+            events_dir, "000001_" + committed["event_id"] + ".json"
+        )
+        with open(committed_path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        data["reviewer_display_name"] = "Mallory"  # corrupt without rehash
+        with open(committed_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        before = self._checkpoint_bytes()
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.advance_review_event_checkpoint(
+                self.task_dir,
+                sequence=tail["sequence"],
+                event_id=tail["event_id"],
+                event_hash=tail["event_hash"],
+            )
+        self.assertEqual(before, self._checkpoint_bytes())
+        self.assertEqual(ri._read_checkpoint(events_dir)["last_sequence"], 1)
+
+    def test_unknown_event_type_tail_recomputed_hash_no_mutation(self):
+        committed = self._committed_head()
+        forged = self._forge_tail(committed, event_type="NO_SUCH_TYPE")
+        events_dir = os.path.join(self.task_dir, "review-events")
+        before = self._checkpoint_bytes()
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.advance_review_event_checkpoint(
+                self.task_dir,
+                sequence=forged["sequence"],
+                event_id=forged["event_id"],
+                event_hash=forged["event_hash"],
+            )
+        self.assertEqual(before, self._checkpoint_bytes())
+        self.assertEqual(ri._read_checkpoint(events_dir)["last_sequence"], 1)
+
+    def test_structurally_malformed_tail_recomputed_hash_no_mutation(self):
+        committed = self._committed_head()
+        forged = self._forge_tail(committed, omit=("details",))
+        events_dir = os.path.join(self.task_dir, "review-events")
+        before = self._checkpoint_bytes()
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.advance_review_event_checkpoint(
+                self.task_dir,
+                sequence=forged["sequence"],
+                event_id=forged["event_id"],
+                event_hash=forged["event_hash"],
+            )
+        self.assertEqual(before, self._checkpoint_bytes())
+        self.assertEqual(ri._read_checkpoint(events_dir)["last_sequence"], 1)
+
+
+class TestCreateReviewEventWrapper(_TaskDirBase):
+    def test_wrapper_signature_and_end_state_preserved(self):
+        event = ri.create_review_event(
+            self.task_dir,
+            event_type="CLAIM_VERIFIED",
+            reviewer_id=REVIEWER_ID,
+            reviewer_display_name=REVIEWER_NAME,
+            timestamp_utc=UTC,
+            manifest_hash_before=HASH_A,
+            manifest_hash_after=HASH_B,
+            details={"key": "value"},
+        )
+        self.assertEqual(event["sequence"], 1)
+        self.assertEqual(event["event_type"], "CLAIM_VERIFIED")
+        self.assertEqual(event["details"], {"key": "value"})
+        recomputed = ri._canonical_hash(ri._event_unsigned_hash_fields(event))
+        self.assertEqual(event["event_hash"], recomputed)
+        events = ri.validate_review_event_chain(self.task_dir)
+        self.assertEqual(len(events), 1)
+        events_dir = os.path.join(self.task_dir, "review-events")
+        checkpoint = ri._read_checkpoint(events_dir)
+        self.assertEqual(checkpoint["last_record_hash"], event["event_hash"])
+
+    def test_wrapper_sequential_appends(self):
+        first = ri.create_review_event(
+            self.task_dir,
+            event_type="CLAIM_VERIFIED",
+            reviewer_id=REVIEWER_ID,
+            reviewer_display_name=REVIEWER_NAME,
+            timestamp_utc=UTC,
+        )
+        second = ri.create_review_event(
+            self.task_dir,
+            event_type="CLAIM_VERIFIED",
+            reviewer_id=REVIEWER_ID,
+            reviewer_display_name=REVIEWER_NAME,
+            timestamp_utc=UTC2,
+        )
+        self.assertEqual(second["sequence"], 2)
+        self.assertEqual(second["previous_event_hash"], first["event_hash"])
+        events = ri.validate_review_event_chain(self.task_dir)
+        self.assertEqual(len(events), 2)
+
+    def test_wrapper_equivalent_to_split_composition(self):
+        # The wrapper's end state must equal the two primitives composed:
+        # event file present, checkpoint committed to it, chain validates.
+        event = ri.create_review_event(
+            self.task_dir,
+            event_type="CLAIM_VERIFIED",
+            reviewer_id=REVIEWER_ID,
+            reviewer_display_name=REVIEWER_NAME,
+            timestamp_utc=UTC,
+        )
+        events_dir = os.path.join(self.task_dir, "review-events")
+        entries = ri._scan_sequence(events_dir)
+        self.assertEqual(entries, [(1, "000001_" + event["event_id"] + ".json")])
+        checkpoint = ri._read_checkpoint(events_dir)
+        self.assertEqual(checkpoint["last_sequence"], 1)
+        self.assertEqual(checkpoint["last_record_id"], event["event_id"])
+        self.assertEqual(checkpoint["last_record_hash"], event["event_hash"])
+
+    def test_wrapper_validation_unchanged(self):
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.create_review_event(
+                self.task_dir,
+                event_type="NO_SUCH_TYPE",
+                reviewer_id=REVIEWER_ID,
+                reviewer_display_name=REVIEWER_NAME,
+                timestamp_utc=UTC,
+            )
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.create_review_event(
+                self.task_dir,
+                event_type="CLAIM_RETRACTED",
+                reviewer_id=REVIEWER_ID,
+                reviewer_display_name=REVIEWER_NAME,
+                timestamp_utc=UTC,
+            )
+        self.assertEqual(ri.validate_review_event_chain(self.task_dir), [])
+
+
+class TestSplitIndependentFailure(_TaskDirBase):
+    def test_interruption_between_split_steps_detected_and_recovered(self):
+        # Simulate a crash after event-file creation, before advancement.
+        event = ri.create_review_event_file(
+            self.task_dir,
+            event_type="CLAIM_VERIFIED",
+            reviewer_id=REVIEWER_ID,
+            reviewer_display_name=REVIEWER_NAME,
+            timestamp_utc=UTC,
+            event_id="d" * 32,
+        )
+        # Detection: committed-chain validation fails closed on the tail.
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.validate_review_event_chain(self.task_dir)
+        # Recovery: advancing with the exact expected parameters commits it.
+        checkpoint = ri.advance_review_event_checkpoint(
+            self.task_dir,
+            sequence=event["sequence"],
+            event_id=event["event_id"],
+            event_hash=event["event_hash"],
+        )
+        self.assertEqual(checkpoint["last_record_id"], "d" * 32)
+        events = ri.validate_review_event_chain(self.task_dir)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_hash"], event["event_hash"])
+
+    def test_recovery_with_wrong_parameters_fails_closed(self):
+        event = ri.create_review_event_file(
+            self.task_dir,
+            event_type="CLAIM_VERIFIED",
+            reviewer_id=REVIEWER_ID,
+            reviewer_display_name=REVIEWER_NAME,
+            timestamp_utc=UTC,
+            event_id="d" * 32,
+        )
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.advance_review_event_checkpoint(
+                self.task_dir,
+                sequence=event["sequence"],
+                event_id="e" * 32,
+                event_hash=event["event_hash"],
+            )
+        events_dir = os.path.join(self.task_dir, "review-events")
+        self.assertIsNone(ri._read_checkpoint(events_dir))
+        # The tail remains uncommitted and still fails closed.
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.validate_review_event_chain(self.task_dir)
 
 
 # ---------------------------------------------------------------------------

@@ -569,7 +569,6 @@ EVENT_TYPES = frozenset(
         "LOCK_ACQUIRED",
         "LOCK_RELEASED",
         "LOCK_RECOVERED",
-        "TRANSACTION_RESUMED",
     }
 )
 
@@ -821,7 +820,75 @@ def _event_unsigned_hash_fields(event: dict) -> dict:
     return {k: v for k, v in event.items() if k != "event_hash"}
 
 
-def create_review_event(
+def _validate_event_record(
+    event: dict,
+    name: str,
+    *,
+    expected_seq: int,
+    previous_hash: str,
+    seen_ids: set[str],
+) -> None:
+    """Fully validate one review event's structure, semantics, and linkage.
+
+    Applies every deterministic per-event rule used by chain validation:
+    required fields, schema version, sequence position, the closed
+    event-type set, duplicate-id rejection, reviewer and timestamp
+    validity, required reasons, previous-hash linkage, and event_hash
+    recomputation. Fails closed on any defect; on success the event id is
+    recorded in seen_ids.
+    """
+    required = (
+        "schema_version", "sequence", "event_id", "event_type",
+        "timestamp_utc", "reviewer_id", "reviewer_display_name",
+        "reason", "previous_event_hash", "manifest_hash_before",
+        "manifest_hash_after", "details", "event_hash",
+    )
+    for field in required:
+        if field not in event:
+            raise ReviewIntegrityError(
+                f"review event {name} missing field: {field}"
+            )
+    if event["schema_version"] != SCHEMA_VERSION:
+        raise ReviewIntegrityError(
+            f"review event {name} has unsupported schema_version: "
+            f"{event['schema_version']!r}"
+        )
+    if event["sequence"] != expected_seq:
+        raise ReviewIntegrityError(
+            f"review event {name} out of order: sequence "
+            f"{event['sequence']} != {expected_seq}"
+        )
+    if event["event_type"] not in EVENT_TYPES:
+        raise ReviewIntegrityError(
+            f"review event {name} has unknown event_type: "
+            f"{event['event_type']!r}"
+        )
+    if event["event_id"] in seen_ids:
+        raise ReviewIntegrityError(
+            f"duplicate review event id: {event['event_id']}"
+        )
+    seen_ids.add(event["event_id"])
+    _validate_reviewer(event["reviewer_id"], event["reviewer_display_name"])
+    _validate_timestamp(event["timestamp_utc"], "event.timestamp_utc")
+    if event["event_type"] in _EVENT_REASON_REQUIRED:
+        if not isinstance(event["reason"], str) or not event["reason"].strip():
+            raise ReviewIntegrityError(
+                f"review event {name} of type {event['event_type']} "
+                "requires a non-empty reason"
+            )
+    if event["previous_event_hash"] != previous_hash:
+        raise ReviewIntegrityError(
+            f"review event {name} chain broken: previous_event_hash "
+            f"{event['previous_event_hash']!r} != {previous_hash!r}"
+        )
+    recomputed = _canonical_hash(_event_unsigned_hash_fields(event))
+    if recomputed != event["event_hash"]:
+        raise ReviewIntegrityError(
+            f"review event {name} modified: event_hash mismatch"
+        )
+
+
+def create_review_event_file(
     task_dir: str,
     *,
     event_type: str,
@@ -832,12 +899,17 @@ def create_review_event(
     manifest_hash_before: str | None = None,
     manifest_hash_after: str | None = None,
     details: dict | None = None,
+    event_id: str | None = None,
 ) -> dict:
-    """Append a new review event to the hash chain.
+    """Create the next immutable review-event file without advancing the checkpoint.
 
-    The event is validated, hash-linked to the current chain head, written
-    atomically, and never overwrites an existing event file. The full chain
-    is validated before and after creation; any defect fails closed.
+    Applies the full existing event validation and construction behavior,
+    then durably creates only the immutable event file (exclusive create,
+    fsync, never overwrite). The new event is an uncommitted tail: chain
+    validation fails closed on it until advance_review_event_checkpoint()
+    commits exactly this event. An existing uncommitted tail blocks further
+    creation (fail closed, no repair or rollback). Never advances the
+    checkpoint, overwrites or deletes events, repairs tails, or rolls back.
     """
     if event_type not in EVENT_TYPES:
         raise ReviewIntegrityError(f"unknown event_type: {event_type!r}")
@@ -860,10 +932,17 @@ def create_review_event(
             )
     if details is not None and not isinstance(details, dict):
         raise ReviewIntegrityError("details must be a mapping")
+    if event_id is not None:
+        if not isinstance(event_id, str) or not re.fullmatch(r"[0-9a-f]{32}", event_id):
+            raise ReviewIntegrityError(
+                "event_id must be a 32-char lowercase hex string"
+            )
 
     directory = _sub_dir(task_dir, REVIEW_EVENTS_DIR)
-    # Validate the existing chain before appending (fail closed).
-    validate_review_event_chain(task_dir)
+    # Validate the existing committed chain before appending (fail closed).
+    # An uncommitted tail from a prior create_review_event_file call makes
+    # this raise, blocking further creation until the tail is committed.
+    committed = validate_review_event_chain(task_dir)
 
     entries = _scan_sequence(directory)
     sequence = entries[-1][0] + 1 if entries else 1
@@ -875,7 +954,14 @@ def create_review_event(
         else _GENESIS_HASH
     )
 
-    event_id = uuid.uuid4().hex
+    if event_id is not None:
+        if any(event["event_id"] == event_id for event in committed):
+            raise ReviewIntegrityError(
+                f"duplicate review event id: {event_id}"
+            )
+    else:
+        event_id = uuid.uuid4().hex
+
     event = {
         "schema_version": SCHEMA_VERSION,
         "sequence": sequence,
@@ -896,19 +982,213 @@ def create_review_event(
     path = _confined_file_path(task_dir, REVIEW_EVENTS_DIR, filename)
     _atomic_create_exclusive(path, _canonical_bytes(event) + b"\n")
 
-    # Write ordering: the immutable event exists before the checkpoint. If
-    # interruption occurs here, the event is an uncommitted tail that fails
-    # closed on the next validation and requires explicit recovery.
-    checkpoint = _build_checkpoint(
+    # Deliberately no checkpoint write and no post-creation chain validation:
+    # committing the tail is advance_review_event_checkpoint()'s sole job.
+    return event
+
+
+def advance_review_event_checkpoint(
+    task_dir: str,
+    *,
+    sequence: int,
+    event_id: str,
+    event_hash: str,
+) -> dict:
+    """Advance the review-event chain-head checkpoint to an existing tail event.
+
+    The referenced event must exist as the exact sole next-sequence tail
+    beyond the committed checkpoint. Every deterministic check runs BEFORE
+    the checkpoint write: the existing checkpoint itself (structure and
+    self-hash), the full committed event prefix (contiguity, complete
+    per-event structure and semantics, hash linkage from genesis, and
+    exact checkpoint agreement), and the candidate tail's complete event
+    structure and semantics (including linkage to the committed chain
+    head) are all fully validated first. Only then is the checkpoint
+    atomically advanced, and the resulting committed chain is fully
+    validated again (fail closed). A rejected advance never mutates the
+    checkpoint. Never creates, modifies, overwrites, or deletes event
+    files.
+    """
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+        raise ReviewIntegrityError("sequence must be a positive integer")
+    if not isinstance(event_id, str) or not re.fullmatch(r"[0-9a-f]{32}", event_id):
+        raise ReviewIntegrityError(
+            "event_id must be a 32-char lowercase hex string"
+        )
+    if not isinstance(event_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", event_hash):
+        raise ReviewIntegrityError(
+            "event_hash must be a lowercase SHA-256 hex digest"
+        )
+
+    directory = _sub_dir(task_dir, REVIEW_EVENTS_DIR, create=False)
+    entries = _scan_sequence(directory)
+    if not entries:
+        raise ReviewIntegrityError(
+            "no review events exist; nothing to advance to"
+        )
+
+    # ------------------------------------------------------------------
+    # Pre-write validation: every deterministic check runs before
+    # _write_checkpoint_atomic. The checkpoint is mutated only after the
+    # existing checkpoint, the committed event prefix, and the candidate
+    # tail have all fully validated.
+    # ------------------------------------------------------------------
+
+    # 1. Fully validate the existing checkpoint itself (structure and
+    #    self-hash) before trusting its last_sequence.
+    checkpoint = _read_checkpoint(directory)
+    if checkpoint is not None:
+        for field in ("schema_version", "chain_type", "last_sequence",
+                      "last_record_id", "last_record_hash", "checkpoint_hash"):
+            if field not in checkpoint:
+                raise ReviewIntegrityError(
+                    f"chain-head checkpoint malformed: missing field: {field}"
+                )
+        if checkpoint["schema_version"] != SCHEMA_VERSION:
+            raise ReviewIntegrityError(
+                "chain-head checkpoint malformed: unsupported schema_version: "
+                f"{checkpoint['schema_version']!r}"
+            )
+        if checkpoint["chain_type"] != CHAIN_TYPE_REVIEW_EVENTS:
+            raise ReviewIntegrityError(
+                "chain-head checkpoint malformed: chain_type mismatch: "
+                f"{checkpoint['chain_type']!r}"
+            )
+        if (
+            not isinstance(checkpoint["last_sequence"], int)
+            or isinstance(checkpoint["last_sequence"], bool)
+            or checkpoint["last_sequence"] < 1
+        ):
+            raise ReviewIntegrityError(
+                "chain-head checkpoint malformed: last_sequence must be a "
+                "positive integer"
+            )
+        recomputed = _canonical_hash(_checkpoint_unsigned_fields(checkpoint))
+        if recomputed != checkpoint["checkpoint_hash"]:
+            raise ReviewIntegrityError(
+                "chain-head checkpoint modified: checkpoint_hash mismatch"
+            )
+    committed_sequence = checkpoint["last_sequence"] if checkpoint is not None else 0
+
+    # 2. Fully validate the committed event prefix: contiguous sequence,
+    #    complete per-event structure and semantics, hash linkage from
+    #    genesis, and exact agreement with the checkpoint.
+    committed_entries = entries[:committed_sequence]
+    _assert_contiguous(committed_entries, "review-events")
+    seen_ids: set[str] = set()
+    committed_records: list[dict] = []
+    previous_hash = _GENESIS_HASH
+    for expected_seq, (seq, name) in enumerate(committed_entries, start=1):
+        record = _read_json_file(os.path.join(directory, name), "review event")
+        _validate_event_record(
+            record,
+            name,
+            expected_seq=expected_seq,
+            previous_hash=previous_hash,
+            seen_ids=seen_ids,
+        )
+        previous_hash = record["event_hash"]
+        committed_records.append(record)
+    _validate_checkpoint(
+        directory, CHAIN_TYPE_REVIEW_EVENTS, committed_entries,
+        committed_records, id_field="event_id", hash_field="event_hash",
+    )
+
+    # 3. Require exactly one uncommitted tail at exactly the next sequence.
+    tails = entries[committed_sequence:]
+    if len(tails) != 1:
+        raise ReviewIntegrityError(
+            f"expected exactly one uncommitted tail beyond committed "
+            f"sequence {committed_sequence}, found {len(tails)}"
+        )
+    tail_seq, tail_name = tails[0]
+    if tail_seq != sequence:
+        raise ReviewIntegrityError(
+            f"referenced sequence {sequence} is not the chain tail "
+            f"(tail is sequence {tail_seq})"
+        )
+    if tail_seq != committed_sequence + 1:
+        raise ReviewIntegrityError(
+            f"tail sequence {tail_seq} is not exactly one beyond the "
+            f"committed checkpoint sequence {committed_sequence}"
+        )
+    expected_name = f"{sequence:06d}_{event_id}.json"
+    if tail_name != expected_name:
+        raise ReviewIntegrityError(
+            f"tail file {tail_name!r} does not match the referenced event "
+            f"{expected_name!r}"
+        )
+
+    # 4. Fully validate the candidate tail's complete structure and
+    #    semantics, including linkage to the committed chain head.
+    event = _read_json_file(os.path.join(directory, tail_name), "review event")
+    _validate_event_record(
+        event,
+        tail_name,
+        expected_seq=sequence,
+        previous_hash=previous_hash,
+        seen_ids=seen_ids,
+    )
+    if event["event_id"] != event_id:
+        raise ReviewIntegrityError(
+            "tail event event_id does not match the referenced event_id"
+        )
+    if event["event_hash"] != event_hash:
+        raise ReviewIntegrityError(
+            "tail event hash mismatch; refusing to advance the checkpoint"
+        )
+
+    # 5. All deterministic checks passed; only now advance the checkpoint.
+    new_checkpoint = _build_checkpoint(
         chain_type=CHAIN_TYPE_REVIEW_EVENTS,
         sequence=sequence,
         record_id=event_id,
-        record_hash=event["event_hash"],
+        record_hash=event_hash,
     )
-    _write_checkpoint_atomic(directory, checkpoint)
+    _write_checkpoint_atomic(directory, new_checkpoint)
 
-    # Fail closed if the append did not produce a valid chain.
+    # Fail closed if the advance did not produce a fully valid committed chain.
     validate_review_event_chain(task_dir)
+    return new_checkpoint
+
+
+def create_review_event(
+    task_dir: str,
+    *,
+    event_type: str,
+    reviewer_id: str,
+    reviewer_display_name: str,
+    timestamp_utc: str,
+    reason: str | None = None,
+    manifest_hash_before: str | None = None,
+    manifest_hash_after: str | None = None,
+    details: dict | None = None,
+) -> dict:
+    """Append a new review event to the hash chain.
+
+    Backward-compatible wrapper with the exact pre-split signature and
+    observable behavior: create the immutable event file, then advance the
+    chain-head checkpoint to it. The event is validated, hash-linked to the
+    current chain head, written atomically, and never overwrites an
+    existing event file; any defect fails closed.
+    """
+    event = create_review_event_file(
+        task_dir,
+        event_type=event_type,
+        reviewer_id=reviewer_id,
+        reviewer_display_name=reviewer_display_name,
+        timestamp_utc=timestamp_utc,
+        reason=reason,
+        manifest_hash_before=manifest_hash_before,
+        manifest_hash_after=manifest_hash_after,
+        details=details,
+    )
+    advance_review_event_checkpoint(
+        task_dir,
+        sequence=event["sequence"],
+        event_id=event["event_id"],
+        event_hash=event["event_hash"],
+    )
     return event
 
 
@@ -929,56 +1209,13 @@ def validate_review_event_chain(task_dir: str) -> list[dict]:
     for expected_seq, (seq, name) in enumerate(entries, start=1):
         path = os.path.join(directory, name)
         event = _read_json_file(path, "review event")
-
-        required = (
-            "schema_version", "sequence", "event_id", "event_type",
-            "timestamp_utc", "reviewer_id", "reviewer_display_name",
-            "reason", "previous_event_hash", "manifest_hash_before",
-            "manifest_hash_after", "details", "event_hash",
+        _validate_event_record(
+            event,
+            name,
+            expected_seq=expected_seq,
+            previous_hash=previous_hash,
+            seen_ids=seen_ids,
         )
-        for field in required:
-            if field not in event:
-                raise ReviewIntegrityError(
-                    f"review event {name} missing field: {field}"
-                )
-        if event["schema_version"] != SCHEMA_VERSION:
-            raise ReviewIntegrityError(
-                f"review event {name} has unsupported schema_version: "
-                f"{event['schema_version']!r}"
-            )
-        if event["sequence"] != expected_seq:
-            raise ReviewIntegrityError(
-                f"review event {name} out of order: sequence "
-                f"{event['sequence']} != {expected_seq}"
-            )
-        if event["event_type"] not in EVENT_TYPES:
-            raise ReviewIntegrityError(
-                f"review event {name} has unknown event_type: "
-                f"{event['event_type']!r}"
-            )
-        if event["event_id"] in seen_ids:
-            raise ReviewIntegrityError(
-                f"duplicate review event id: {event['event_id']}"
-            )
-        seen_ids.add(event["event_id"])
-        _validate_reviewer(event["reviewer_id"], event["reviewer_display_name"])
-        _validate_timestamp(event["timestamp_utc"], "event.timestamp_utc")
-        if event["event_type"] in _EVENT_REASON_REQUIRED:
-            if not isinstance(event["reason"], str) or not event["reason"].strip():
-                raise ReviewIntegrityError(
-                    f"review event {name} of type {event['event_type']} "
-                    "requires a non-empty reason"
-                )
-        if event["previous_event_hash"] != previous_hash:
-            raise ReviewIntegrityError(
-                f"review event {name} chain broken: previous_event_hash "
-                f"{event['previous_event_hash']!r} != {previous_hash!r}"
-            )
-        recomputed = _canonical_hash(_event_unsigned_hash_fields(event))
-        if recomputed != event["event_hash"]:
-            raise ReviewIntegrityError(
-                f"review event {name} modified: event_hash mismatch"
-            )
         previous_hash = event["event_hash"]
         events.append(event)
 
