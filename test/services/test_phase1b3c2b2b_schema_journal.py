@@ -14,8 +14,10 @@ Fully offline tests (zero network access). Covers:
 - journal creation and validation
 - every valid stage
 - invalid stage
+- skipped, repeated, or reversed stage rejection
 - journal-hash modification
 - immutable-field modification
+- unknown or missing journal fields
 - traversal and unsafe paths
 - journal overwrite conflict
 - atomic cleanup after injected failures
@@ -47,6 +49,22 @@ REVIEWER_ID = "rick.gamboa"
 REVIEWER_NAME = "Rick Gamboa"
 HASH_A = "a" * 64
 HASH_B = "b" * 64
+
+JOURNAL_KWARGS = dict(
+    operation="verify-claim",
+    task_id="task-001",
+    claim_id="claim-" + "a" * 32,
+    starting_manifest_hash=HASH_A,
+    proposed_manifest_hash=HASH_B,
+    proposed_manifest_relative_path=".proposed_manifest.json.abc123.tmp",
+    snapshot_relative_path="manifest-history/000001_" + HASH_A + ".json",
+    expected_event_id="e" * 32,
+    expected_event_hash="c" * 64,
+    lock_token="b" * 32,
+    created_at_utc=UTC,
+    original_reviewer_id=REVIEWER_ID,
+    original_reviewer_display_name=REVIEWER_NAME,
+)
 
 
 def _blocked_socket(*args, **kwargs):
@@ -484,16 +502,7 @@ class TestMigration(_TaskDirBase):
 
 class TestTransactionJournal(_TaskDirBase):
     def _create_journal(self, **overrides):
-        kwargs = dict(
-            operation="verify-claim",
-            starting_manifest_hash=HASH_A,
-            proposed_manifest_hash=HASH_B,
-            reviewer_id=REVIEWER_ID,
-            reviewer_display_name=REVIEWER_NAME,
-            claim_id="claim-" + "a" * 32,
-            created_at_utc=UTC,
-            lock_token="b" * 32,
-        )
+        kwargs = dict(JOURNAL_KWARGS)
         kwargs.update(overrides)
         return ri.create_transaction_journal(self.task_dir, **kwargs)
 
@@ -530,7 +539,8 @@ class TestTransactionJournal(_TaskDirBase):
     def test_read_modified_journal_hash_fails_closed(self):
         journal = self._create_journal()
         path = os.path.join(self.task_dir, "review-transaction.json")
-        data = json.loads(open(path, encoding="utf-8").read())
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
         data["transaction_stage"] = "LOCK_ACQUIRED"
         with open(path, "w", encoding="utf-8") as h:
             json.dump(data, h)
@@ -540,7 +550,8 @@ class TestTransactionJournal(_TaskDirBase):
     def test_read_modified_immutable_field_fails_closed(self):
         journal = self._create_journal()
         path = os.path.join(self.task_dir, "review-transaction.json")
-        data = json.loads(open(path, encoding="utf-8").read())
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
         data["operation"] = "retract-claim"
         with open(path, "w", encoding="utf-8") as h:
             json.dump(data, h)
@@ -563,9 +574,10 @@ class TestTransactionJournal(_TaskDirBase):
         stages = [
             "LOCK_ACQUIRED",
             "SNAPSHOT_CREATED",
+            "PROPOSED_MANIFEST_READY",
             "EVENT_CREATED",
             "CHECKPOINT_UPDATED",
-            "MANIFEST_WRITTEN",
+            "MANIFEST_INSTALLED",
             "COMMITTED",
         ]
         for stage in stages:
@@ -598,6 +610,46 @@ class TestTransactionJournal(_TaskDirBase):
                 transaction_id=journal["transaction_id"],
                 new_stage="INITIATED",
             )
+        read_back = ri.read_transaction_journal(self.task_dir)
+        self.assertEqual(read_back["transaction_stage"], "LOCK_ACQUIRED")
+
+    def test_update_stage_skip_rejected(self):
+        journal = self._create_journal()
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.update_transaction_stage(
+                self.task_dir,
+                transaction_id=journal["transaction_id"],
+                new_stage="SNAPSHOT_CREATED",
+            )
+        read_back = ri.read_transaction_journal(self.task_dir)
+        self.assertEqual(read_back["transaction_stage"], "INITIATED")
+
+    def test_update_stage_repeat_rejected(self):
+        journal = self._create_journal()
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.update_transaction_stage(
+                self.task_dir,
+                transaction_id=journal["transaction_id"],
+                new_stage="INITIATED",
+            )
+        read_back = ri.read_transaction_journal(self.task_dir)
+        self.assertEqual(read_back["transaction_stage"], "INITIATED")
+
+    def test_update_stage_skip_rejected_later(self):
+        journal = self._create_journal()
+        ri.update_transaction_stage(
+            self.task_dir,
+            transaction_id=journal["transaction_id"],
+            new_stage="LOCK_ACQUIRED",
+        )
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.update_transaction_stage(
+                self.task_dir,
+                transaction_id=journal["transaction_id"],
+                new_stage="EVENT_CREATED",
+            )
+        read_back = ri.read_transaction_journal(self.task_dir)
+        self.assertEqual(read_back["transaction_stage"], "LOCK_ACQUIRED")
 
     def test_update_stage_wrong_transaction_id(self):
         journal = self._create_journal()
@@ -649,6 +701,77 @@ class TestTransactionJournal(_TaskDirBase):
             ri.os.open = original_open
         # No temp files left behind.
         leftovers = [f for f in os.listdir(self.task_dir) if "tmp" in f or "part" in f]
+        self.assertEqual(leftovers, [])
+
+    def test_create_absolute_path_rejected(self):
+        absolute = os.path.join(self.task_dir, "elsewhere.json")
+        with self.assertRaises(ri.ReviewIntegrityError):
+            self._create_journal(proposed_manifest_relative_path=absolute)
+        self.assertIsNone(ri.read_transaction_journal(self.task_dir))
+
+    def test_create_parent_traversal_rejected(self):
+        with self.assertRaises(ri.ReviewIntegrityError):
+            self._create_journal(snapshot_relative_path="../escape.json")
+        self.assertIsNone(ri.read_transaction_journal(self.task_dir))
+
+    def test_create_nested_escape_rejected(self):
+        with self.assertRaises(ri.ReviewIntegrityError):
+            self._create_journal(
+                proposed_manifest_relative_path="subdir/../../escape.json"
+            )
+        self.assertIsNone(ri.read_transaction_journal(self.task_dir))
+
+    def _rewrite_journal_file(self, mutate):
+        path = os.path.join(self.task_dir, "review-transaction.json")
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        mutate(data)
+        data["journal_hash"] = ri._canonical_hash(ri._journal_unsigned_fields(data))
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        return data
+
+    def test_read_unknown_field_fails_closed(self):
+        self._create_journal()
+        self._rewrite_journal_file(lambda d: d.__setitem__("unexpected_field", 1))
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.read_transaction_journal(self.task_dir)
+
+    def test_read_missing_field_fails_closed(self):
+        self._create_journal()
+        self._rewrite_journal_file(lambda d: d.__delitem__("task_id"))
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.read_transaction_journal(self.task_dir)
+
+    def test_read_modified_original_reviewer_fails_closed(self):
+        self._create_journal()
+        path = os.path.join(self.task_dir, "review-transaction.json")
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        data["original_reviewer_id"] = "mallory"
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.read_transaction_journal(self.task_dir)
+
+    def test_update_writes_canonical_atomic_replacement(self):
+        journal = self._create_journal()
+        updated = ri.update_transaction_stage(
+            self.task_dir,
+            transaction_id=journal["transaction_id"],
+            new_stage="LOCK_ACQUIRED",
+        )
+        path = os.path.join(self.task_dir, "review-transaction.json")
+        with open(path, "rb") as handle:
+            raw = handle.read()
+        self.assertTrue(raw.endswith(b"\n"))
+        on_disk = json.loads(raw.decode("utf-8"))
+        self.assertEqual(on_disk, updated)
+        read_back = ri.read_transaction_journal(self.task_dir)
+        self.assertEqual(read_back["transaction_stage"], "LOCK_ACQUIRED")
+        leftovers = [
+            f for f in os.listdir(self.task_dir) if "tmp" in f or "part" in f
+        ]
         self.assertEqual(leftovers, [])
 
 
@@ -808,17 +931,7 @@ class TestReadOnlyCliDetection(unittest.TestCase):
         self.assertIn("transaction status:   none", out)
 
     def test_status_with_valid_journal(self):
-        ri.create_transaction_journal(
-            self.task_dir,
-            operation="verify-claim",
-            starting_manifest_hash=HASH_A,
-            proposed_manifest_hash=HASH_B,
-            reviewer_id=REVIEWER_ID,
-            reviewer_display_name=REVIEWER_NAME,
-            claim_id="claim-" + "a" * 32,
-            created_at_utc=UTC,
-            lock_token="b" * 32,
-        )
+        ri.create_transaction_journal(self.task_dir, **JOURNAL_KWARGS)
         code, out, _ = self._run_cli("status")
         self.assertEqual(code, 1)
         self.assertIn("INCOMPLETE_TRANSACTION", out)
@@ -836,17 +949,7 @@ class TestReadOnlyCliDetection(unittest.TestCase):
         self.assertIn("PASS", out)
 
     def test_audit_with_valid_journal(self):
-        ri.create_transaction_journal(
-            self.task_dir,
-            operation="verify-claim",
-            starting_manifest_hash=HASH_A,
-            proposed_manifest_hash=HASH_B,
-            reviewer_id=REVIEWER_ID,
-            reviewer_display_name=REVIEWER_NAME,
-            claim_id="claim-" + "a" * 32,
-            created_at_utc=UTC,
-            lock_token="b" * 32,
-        )
+        ri.create_transaction_journal(self.task_dir, **JOURNAL_KWARGS)
         code, out, _ = self._run_cli("audit")
         self.assertEqual(code, 1)
         self.assertIn("FAIL", out)
@@ -861,17 +964,7 @@ class TestReadOnlyCliDetection(unittest.TestCase):
         self.assertIn("INCOMPLETE_TRANSACTION", out)
 
     def test_read_only_byte_for_byte_with_journal(self):
-        ri.create_transaction_journal(
-            self.task_dir,
-            operation="verify-claim",
-            starting_manifest_hash=HASH_A,
-            proposed_manifest_hash=HASH_B,
-            reviewer_id=REVIEWER_ID,
-            reviewer_display_name=REVIEWER_NAME,
-            claim_id="claim-" + "a" * 32,
-            created_at_utc=UTC,
-            lock_token="b" * 32,
-        )
+        ri.create_transaction_journal(self.task_dir, **JOURNAL_KWARGS)
         before = self._snapshot_tree()
         code, _, _ = self._run_cli("status")
         after = self._snapshot_tree()
@@ -879,17 +972,7 @@ class TestReadOnlyCliDetection(unittest.TestCase):
         self.assertEqual(before, after)
 
     def test_read_only_byte_for_byte_audit_with_journal(self):
-        ri.create_transaction_journal(
-            self.task_dir,
-            operation="verify-claim",
-            starting_manifest_hash=HASH_A,
-            proposed_manifest_hash=HASH_B,
-            reviewer_id=REVIEWER_ID,
-            reviewer_display_name=REVIEWER_NAME,
-            claim_id="claim-" + "a" * 32,
-            created_at_utc=UTC,
-            lock_token="b" * 32,
-        )
+        ri.create_transaction_journal(self.task_dir, **JOURNAL_KWARGS)
         before = self._snapshot_tree()
         code, _, _ = self._run_cli("audit")
         after = self._snapshot_tree()

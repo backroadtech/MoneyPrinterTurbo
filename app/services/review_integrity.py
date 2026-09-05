@@ -203,33 +203,62 @@ def _validate_checkpoint(
 
 TRANSACTION_JOURNAL_NAME = "review-transaction.json"
 
-TRANSACTION_STAGES = frozenset(
-    {
-        "INITIATED",
-        "LOCK_ACQUIRED",
-        "SNAPSHOT_CREATED",
-        "EVENT_CREATED",
-        "CHECKPOINT_UPDATED",
-        "MANIFEST_WRITTEN",
-        "COMMITTED",
-    }
+# Approved eight-stage forward-only sequence (order matters).
+TRANSACTION_STAGES = (
+    "INITIATED",
+    "LOCK_ACQUIRED",
+    "SNAPSHOT_CREATED",
+    "PROPOSED_MANIFEST_READY",
+    "EVENT_CREATED",
+    "CHECKPOINT_UPDATED",
+    "MANIFEST_INSTALLED",
+    "COMMITTED",
 )
 
 TRANSACTION_OPERATIONS = frozenset({"verify-claim", "retract-claim"})
 
-# Immutable fields that must never change after journal creation.
+# Required journal fields, in the approved schema order. Unknown fields are
+# rejected; journal_hash is the canonical self-hash over every other field.
+_JOURNAL_REQUIRED_FIELDS = (
+    "schema_version",
+    "transaction_id",
+    "operation",
+    "task_id",
+    "claim_id",
+    "starting_manifest_hash",
+    "proposed_manifest_hash",
+    "proposed_manifest_relative_path",
+    "snapshot_relative_path",
+    "expected_event_id",
+    "expected_event_hash",
+    "lock_token",
+    "transaction_stage",
+    "created_at_utc",
+    "original_reviewer_id",
+    "original_reviewer_display_name",
+    "journal_hash",
+)
+
+# Immutable fields that must never change after journal creation. Only
+# transaction_stage (and the derived journal_hash) may change, and only
+# through the update primitive.
 _JOURNAL_IMMUTABLE_FIELDS = frozenset(
     {
         "schema_version",
         "transaction_id",
         "operation",
+        "task_id",
+        "claim_id",
         "starting_manifest_hash",
         "proposed_manifest_hash",
-        "reviewer_id",
-        "reviewer_display_name",
-        "claim_id",
-        "created_at_utc",
+        "proposed_manifest_relative_path",
+        "snapshot_relative_path",
+        "expected_event_id",
+        "expected_event_hash",
         "lock_token",
+        "created_at_utc",
+        "original_reviewer_id",
+        "original_reviewer_display_name",
     }
 )
 
@@ -248,19 +277,45 @@ def _journal_unsigned_fields(journal: dict) -> dict:
     return {k: v for k, v in journal.items() if k != "journal_hash"}
 
 
-def _validate_journal_structure(journal: dict) -> None:
-    """Validate journal structure, stage, and hash. Fails closed on any defect."""
-    required = (
-        "schema_version", "transaction_id", "operation",
-        "starting_manifest_hash", "proposed_manifest_hash",
-        "reviewer_id", "reviewer_display_name", "claim_id",
-        "transaction_stage", "created_at_utc", "lock_token", "journal_hash",
-    )
-    for field in required:
+def _validate_journal_relative_path(base: str, value, field: str) -> None:
+    """Require a task-confined relative path.
+
+    Absolute paths, parent traversal, and resolved paths escaping the task
+    directory are rejected.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ReviewIntegrityError(
+            f"transaction journal {field} must be a non-empty relative path"
+        )
+    if os.path.isabs(value):
+        raise ReviewIntegrityError(
+            f"transaction journal {field} must be relative, not absolute"
+        )
+    resolved = os.path.realpath(os.path.join(base, value))
+    try:
+        common = os.path.commonpath([base, resolved])
+    except ValueError as exc:  # different drives on Windows
+        raise ReviewIntegrityError(
+            f"transaction journal {field} escapes the task directory"
+        ) from exc
+    if common != base:
+        raise ReviewIntegrityError(
+            f"transaction journal {field} escapes the task directory"
+        )
+
+
+def _validate_journal_structure(journal: dict, base: str) -> None:
+    """Validate journal fields, stage, paths, and hash. Fails closed on any defect."""
+    for field in _JOURNAL_REQUIRED_FIELDS:
         if field not in journal:
             raise ReviewIntegrityError(
                 f"transaction journal missing field: {field}"
             )
+    unknown = set(journal) - set(_JOURNAL_REQUIRED_FIELDS)
+    if unknown:
+        raise ReviewIntegrityError(
+            f"transaction journal has unknown field(s): {sorted(unknown)!r}"
+        )
     if journal["schema_version"] != SCHEMA_VERSION:
         raise ReviewIntegrityError(
             f"transaction journal has unsupported schema_version: "
@@ -276,25 +331,35 @@ def _validate_journal_structure(journal: dict) -> None:
             f"transaction journal has unknown stage: "
             f"{journal['transaction_stage']!r}"
         )
-    _validate_reviewer(journal["reviewer_id"], journal["reviewer_display_name"])
+    if not isinstance(journal["task_id"], str) or not journal["task_id"].strip():
+        raise ReviewIntegrityError(
+            "transaction journal task_id must be a non-empty string"
+        )
+    _validate_reviewer(
+        journal["original_reviewer_id"], journal["original_reviewer_display_name"]
+    )
     _validate_timestamp(journal["created_at_utc"], "journal.created_at_utc")
-    if not re.fullmatch(r"[0-9a-f]{64}", journal["starting_manifest_hash"] or ""):
-        raise ReviewIntegrityError(
-            "transaction journal starting_manifest_hash must be a SHA-256 hex digest"
-        )
-    if not re.fullmatch(r"[0-9a-f]{64}", journal["proposed_manifest_hash"] or ""):
-        raise ReviewIntegrityError(
-            "transaction journal proposed_manifest_hash must be a SHA-256 hex digest"
-        )
-    if not re.fullmatch(r"[0-9a-f]{32}", journal["transaction_id"] or ""):
-        raise ReviewIntegrityError(
-            "transaction journal transaction_id must be a 32-char hex string"
-        )
-    if not re.fullmatch(r"[0-9a-f]{32}", journal["lock_token"] or ""):
-        raise ReviewIntegrityError(
-            "transaction journal lock_token must be a 32-char hex string"
-        )
+    for field in ("starting_manifest_hash", "proposed_manifest_hash",
+                  "expected_event_hash"):
+        value = journal[field]
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ReviewIntegrityError(
+                f"transaction journal {field} must be a SHA-256 hex digest"
+            )
+    for field in ("transaction_id", "lock_token", "expected_event_id"):
+        value = journal[field]
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
+            raise ReviewIntegrityError(
+                f"transaction journal {field} must be a 32-char hex string"
+            )
     prov.validate_claim_id(journal["claim_id"], "journal.claim_id")
+    _validate_journal_relative_path(
+        base, journal["proposed_manifest_relative_path"],
+        "proposed_manifest_relative_path",
+    )
+    _validate_journal_relative_path(
+        base, journal["snapshot_relative_path"], "snapshot_relative_path"
+    )
     # Verify journal hash.
     recomputed = _canonical_hash(_journal_unsigned_fields(journal))
     if recomputed != journal["journal_hash"]:
@@ -307,38 +372,60 @@ def create_transaction_journal(
     task_dir: str,
     *,
     operation: str,
+    task_id: str,
+    claim_id: str,
     starting_manifest_hash: str,
     proposed_manifest_hash: str,
-    reviewer_id: str,
-    reviewer_display_name: str,
-    claim_id: str,
-    created_at_utc: str,
+    proposed_manifest_relative_path: str,
+    snapshot_relative_path: str,
+    expected_event_id: str,
+    expected_event_hash: str,
     lock_token: str,
+    created_at_utc: str,
+    original_reviewer_id: str,
+    original_reviewer_display_name: str,
 ) -> dict:
-    """Create a new transaction journal atomically.
+    """Create a new transaction journal atomically at INITIATED.
 
-    Fails closed if a journal already exists (overwrite conflict).
-    Returns the created journal record.
+    Fails closed if a journal already exists (overwrite conflict) or any
+    field fails validation. Returns the created journal record.
     """
     if operation not in TRANSACTION_OPERATIONS:
         raise ReviewIntegrityError(f"unknown operation: {operation!r}")
-    _validate_reviewer(reviewer_id, reviewer_display_name)
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise ReviewIntegrityError("task_id must be a non-empty string")
+    _validate_reviewer(original_reviewer_id, original_reviewer_display_name)
     _validate_timestamp(created_at_utc, "journal.created_at_utc")
-    if not re.fullmatch(r"[0-9a-f]{64}", starting_manifest_hash or ""):
-        raise ReviewIntegrityError(
-            "starting_manifest_hash must be a SHA-256 hex digest"
-        )
-    if not re.fullmatch(r"[0-9a-f]{64}", proposed_manifest_hash or ""):
-        raise ReviewIntegrityError(
-            "proposed_manifest_hash must be a SHA-256 hex digest"
-        )
-    prov.validate_claim_id(claim_id, "journal.claim_id")
-    if not re.fullmatch(r"[0-9a-f]{32}", lock_token or ""):
+    for field_name, value in (
+        ("starting_manifest_hash", starting_manifest_hash),
+        ("proposed_manifest_hash", proposed_manifest_hash),
+        ("expected_event_hash", expected_event_hash),
+    ):
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ReviewIntegrityError(
+                f"{field_name} must be a SHA-256 hex digest"
+            )
+    if not isinstance(lock_token, str) or not re.fullmatch(r"[0-9a-f]{32}", lock_token):
         raise ReviewIntegrityError(
             "lock_token must be a 32-char hex string"
         )
+    if not isinstance(expected_event_id, str) or not re.fullmatch(
+        r"[0-9a-f]{32}", expected_event_id
+    ):
+        raise ReviewIntegrityError(
+            "expected_event_id must be a 32-char hex string"
+        )
+    prov.validate_claim_id(claim_id, "journal.claim_id")
 
     path = _journal_path(task_dir)
+    base = os.path.dirname(path)
+    _validate_journal_relative_path(
+        base, proposed_manifest_relative_path, "proposed_manifest_relative_path"
+    )
+    _validate_journal_relative_path(
+        base, snapshot_relative_path, "snapshot_relative_path"
+    )
+
     if os.path.exists(path):
         raise ReviewIntegrityError(
             f"transaction journal already exists: {TRANSACTION_JOURNAL_NAME!r}"
@@ -348,14 +435,19 @@ def create_transaction_journal(
         "schema_version": SCHEMA_VERSION,
         "transaction_id": uuid.uuid4().hex,
         "operation": operation,
+        "task_id": task_id,
+        "claim_id": claim_id,
         "starting_manifest_hash": starting_manifest_hash,
         "proposed_manifest_hash": proposed_manifest_hash,
-        "reviewer_id": reviewer_id,
-        "reviewer_display_name": reviewer_display_name,
-        "claim_id": claim_id,
+        "proposed_manifest_relative_path": proposed_manifest_relative_path,
+        "snapshot_relative_path": snapshot_relative_path,
+        "expected_event_id": expected_event_id,
+        "expected_event_hash": expected_event_hash,
+        "lock_token": lock_token,
         "transaction_stage": "INITIATED",
         "created_at_utc": created_at_utc,
-        "lock_token": lock_token,
+        "original_reviewer_id": original_reviewer_id,
+        "original_reviewer_display_name": original_reviewer_display_name,
     }
     journal["journal_hash"] = _canonical_hash(_journal_unsigned_fields(journal))
 
@@ -372,7 +464,7 @@ def read_transaction_journal(task_dir: str) -> dict | None:
     if not os.path.exists(path):
         return None
     journal = _read_json_file(path, "transaction journal")
-    _validate_journal_structure(journal)
+    _validate_journal_structure(journal, os.path.dirname(path))
     return journal
 
 
@@ -387,7 +479,7 @@ def update_transaction_stage(
     Fails closed if:
     - No journal exists
     - transaction_id does not match
-    - new_stage is not a valid forward transition
+    - new_stage is not the immediately following stage
     - Any immutable field would change
 
     Returns the updated journal record.
@@ -408,22 +500,15 @@ def update_transaction_stage(
             f"got {transaction_id!r}"
         )
 
-    # Validate forward-only transition.
-    stage_order = [
-        "INITIATED",
-        "LOCK_ACQUIRED",
-        "SNAPSHOT_CREATED",
-        "EVENT_CREATED",
-        "CHECKPOINT_UPDATED",
-        "MANIFEST_WRITTEN",
-        "COMMITTED",
-    ]
+    # Validate strictly-forward transition: only the immediately following
+    # stage is permitted. Skips, repeats, and reversals fail closed.
+    stage_order = TRANSACTION_STAGES
     current_idx = stage_order.index(journal["transaction_stage"])
     new_idx = stage_order.index(new_stage)
-    if new_idx <= current_idx:
+    if new_idx != current_idx + 1:
         raise ReviewIntegrityError(
             f"invalid stage transition: {journal['transaction_stage']} -> {new_stage} "
-            "(must move forward)"
+            "(only the immediately following stage is allowed)"
         )
 
     # Build updated journal with only the stage changed.
