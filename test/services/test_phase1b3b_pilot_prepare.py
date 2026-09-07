@@ -18,6 +18,7 @@ Covers:
 """
 
 import dataclasses
+import hashlib
 import json
 import os
 import socket
@@ -999,6 +1000,345 @@ class TestRenderLocalInputLoading(unittest.TestCase):
                     self.assertNotIn(canary, message)
                 # Refusals leave the whole temp tree untouched.
                 self.assertEqual(self.tree_snapshot(), before)
+
+
+# ---------------------------------------------------------------------------
+# Render-local task staging (task-local copies, hashing, owned rollback)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderLocalTaskStaging(unittest.TestCase):
+    """Focused tests for _stage_render_local_task.
+
+    The storage root is isolated by pointing pilot_prepare.__file__ at the
+    temp sandbox, and utils.get_uuid is patched to a known canonical UUID.
+    Real storage artifacts are never touched.
+    """
+
+    KNOWN_TASK_ID = "12345678-1234-5678-1234-567812345678"
+
+    def setUp(self):
+        self._net = _NetworkBlocker()
+        self._net.__enter__()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        self.storage_root = os.path.join(self.root, "storage", "tasks")
+        self._file_patch = patch.object(
+            pilot_prepare,
+            "__file__",
+            os.path.join(self.root, "pilot_prepare.py"),
+        )
+        self._file_patch.start()
+        self._uuid_patch = patch(
+            "app.utils.utils.get_uuid", return_value=self.KNOWN_TASK_ID
+        )
+        self._uuid_patch.start()
+
+    def tearDown(self):
+        self._uuid_patch.stop()
+        self._file_patch.stop()
+        self._tmp.cleanup()
+        self._net.__exit__(None, None, None)
+
+    # -- fixture helpers ----------------------------------------------------
+
+    def write_source(self, name: str, data: bytes) -> str:
+        path = os.path.join(self.root, "src", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def make_loaded(self, script_bytes, materials):
+        script_src = self.write_source("script.txt", script_bytes)
+        resolved_paths = []
+        material_requests = []
+        for index, (name, data) in enumerate(materials):
+            src = self.write_source(name, data)
+            resolved_paths.append(os.path.realpath(src))
+            material_requests.append(
+                pilot_prepare.RenderLocalMaterialRequest(
+                    path=src,
+                    license_name=f"license-{index}",
+                    license_evidence=f"evidence-{index}",
+                )
+            )
+        request = pilot_prepare.RenderLocalRequest(
+            topic="topic",
+            script_path=script_src,
+            materials=tuple(material_requests),
+            claims=(("claim", "source"),),
+        )
+        return pilot_prepare.RenderLocalLoadedInputs(
+            request=request,
+            script_path=os.path.realpath(script_src),
+            script_bytes=script_bytes,
+            script_text=script_bytes.decode("utf-8"),
+            material_paths=tuple(resolved_paths),
+        )
+
+    def tree_snapshot(self):
+        dirs = set()
+        files = {}
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            for dirname in dirnames:
+                dirs.add(os.path.relpath(os.path.join(dirpath, dirname),
+                                         self.root))
+            for filename in filenames:
+                full = os.path.join(dirpath, filename)
+                with open(full, "rb") as handle:
+                    files[os.path.relpath(full, self.root)] = handle.read()
+        return dirs, files
+
+    # -- 1. happy path --------------------------------------------------------
+
+    def test_happy_path_stages_and_hashes_task_local_copies(self):
+        script_bytes = "Script line one\r\ncafé 中文\r\n".encode("utf-8")
+        loaded = self.make_loaded(
+            script_bytes,
+            [("clip-b.mp4", b"bytes-b"), ("clip-a.mp4", b"bytes-a")],
+        )
+        forbidden_prefixes = (
+            "app.services.task",
+            "app.services.llm",
+            "app.services.voice",
+            "app.services.material",
+            "app.services.video",
+            "app.services.upload_post",
+            "app.services.version_checker",
+            "app.controllers",
+            "app.services.egress",
+        )
+        before_modules = {
+            name for name in sys.modules if name.startswith(forbidden_prefixes)
+        }
+
+        result = pilot_prepare._stage_render_local_task(loaded)
+
+        after_modules = {
+            name for name in sys.modules if name.startswith(forbidden_prefixes)
+        }
+        self.assertEqual(after_modules - before_modules, set())
+
+        self.assertEqual(result.task_id, self.KNOWN_TASK_ID)
+        self.assertEqual(os.path.basename(result.task_dir), self.KNOWN_TASK_ID)
+        self.assertTrue(os.path.isdir(result.task_dir))
+        self.assertIs(result.loaded, loaded)
+
+        # script.md holds the exact loaded bytes.
+        self.assertEqual(os.path.basename(result.script_path), "script.md")
+        self.assertEqual(os.path.dirname(result.script_path), result.task_dir)
+        with open(result.script_path, "rb") as handle:
+            self.assertEqual(handle.read(), script_bytes)
+        self.assertEqual(result.script_text, script_bytes.decode("utf-8"))
+        self.assertEqual(
+            result.script_sha256,
+            prov.sha256_file_streamed(result.script_path),
+        )
+        self.assertEqual(
+            result.script_sha256, hashlib.sha256(script_bytes).hexdigest()
+        )
+
+        # Materials: inside task_dir/materials, ordered, bytes equal,
+        # hashes equal the production streamed SHA-256 results.
+        expected_names = ["clip-b.mp4", "clip-a.mp4"]
+        expected_bytes = [b"bytes-b", b"bytes-a"]
+        self.assertEqual(len(result.materials), 2)
+        for index, (staged_path, staged_hash) in enumerate(result.materials):
+            self.assertEqual(
+                os.path.dirname(staged_path),
+                os.path.join(result.task_dir, "materials"),
+            )
+            self.assertEqual(
+                os.path.basename(staged_path), expected_names[index]
+            )
+            with open(staged_path, "rb") as handle:
+                self.assertEqual(handle.read(), expected_bytes[index])
+            self.assertEqual(
+                staged_hash, prov.sha256_file_streamed(staged_path)
+            )
+            self.assertEqual(
+                staged_hash,
+                hashlib.sha256(expected_bytes[index]).hexdigest(),
+            )
+
+        # Ordering stays aligned with the original license evidence.
+        self.assertEqual(
+            [m.license_evidence for m in result.loaded.request.materials],
+            ["evidence-0", "evidence-1"],
+        )
+
+        # External sources remain byte-for-byte unchanged.
+        with open(loaded.script_path, "rb") as handle:
+            self.assertEqual(handle.read(), script_bytes)
+        for index, source in enumerate(loaded.material_paths):
+            with open(source, "rb") as handle:
+                self.assertEqual(handle.read(), expected_bytes[index])
+
+        # No manifest and no stray files are created by staging.
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(result.task_dir, "provenance_manifest.json")
+            )
+        )
+        staged_files = []
+        for dirpath, _, filenames in os.walk(result.task_dir):
+            for filename in filenames:
+                staged_files.append(
+                    os.path.relpath(os.path.join(dirpath, filename),
+                                    result.task_dir)
+                )
+        self.assertEqual(
+            sorted(staged_files),
+            [
+                os.path.join("materials", "clip-a.mp4"),
+                os.path.join("materials", "clip-b.mp4"),
+                "script.md",
+            ],
+        )
+
+        # Returned structure is immutable.
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            result.task_id = "mutated"
+
+    # -- 2. fresh-directory refusal -------------------------------------------
+
+    def test_existing_task_directory_refused(self):
+        loaded = self.make_loaded(
+            b"script CANARY-ex1", [("clip-CANARY-e1.mp4", b"m")]
+        )
+        existing = os.path.join(self.storage_root, self.KNOWN_TASK_ID)
+        os.makedirs(existing)
+        sentinel = os.path.join(existing, "sentinel-CANARY-ex2.txt")
+        with open(sentinel, "wb") as handle:
+            handle.write(b"keep me")
+        before = self.tree_snapshot()
+
+        with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+            pilot_prepare._stage_render_local_task(loaded)
+
+        message = str(ctx.exception)
+        self.assertEqual(
+            message, "render-local staging task directory already exists"
+        )
+        self.assertIsInstance(ctx.exception.__cause__, FileExistsError)
+        self.assertNotIn("CANARY-ex1", message)
+        self.assertNotIn("CANARY-ex2", message)
+        self.assertNotIn(self.KNOWN_TASK_ID, message)
+        # Existing directory/tree remains byte-for-byte unchanged.
+        self.assertEqual(self.tree_snapshot(), before)
+
+    # -- 3. injected failure during the second material copy ------------------
+
+    def test_rollback_on_second_material_copy_failure(self):
+        loaded = self.make_loaded(
+            b"script CANARY-script",
+            [
+                ("clip-one-CANARY-m1.mp4", b"m1-bytes"),
+                ("clip-two-CANARY-m2.mp4", b"m2-bytes"),
+            ],
+        )
+        os.makedirs(self.storage_root)  # pre-existing parents must remain
+        real_write = pilot_prepare._atomic_write_stream
+
+        def flaky(target, chunks):
+            if target.endswith("clip-two-CANARY-m2.mp4"):
+                raise OSError("injected copy failure CANARY-inject")
+            return real_write(target, chunks)
+
+        before = self.tree_snapshot()
+        with patch.object(
+            pilot_prepare, "_atomic_write_stream", side_effect=flaky
+        ):
+            with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                pilot_prepare._stage_render_local_task(loaded)
+
+        message = str(ctx.exception)
+        self.assertEqual(message, "render-local staging failed")
+        # Native failure survives only as the internal cause.
+        self.assertIsInstance(ctx.exception.__cause__, OSError)
+        for canary in (
+            "CANARY-script",
+            "CANARY-m1",
+            "CANARY-m2",
+            "CANARY-inject",
+            self.KNOWN_TASK_ID,
+        ):
+            self.assertNotIn(canary, message)
+        # No script, material, temp, or generated task directory remains.
+        self.assertFalse(
+            os.path.exists(os.path.join(self.storage_root,
+                                        self.KNOWN_TASK_ID))
+        )
+        self.assertEqual(os.listdir(self.storage_root), [])
+        # Pre-existing parents remain; external inputs unchanged.
+        self.assertTrue(os.path.isdir(self.storage_root))
+        self.assertEqual(self.tree_snapshot(), before)
+
+    # -- 4. injected script-write / hash failure ------------------------------
+
+    def _assert_rollback_guarantees(self, ctx, before, canaries):
+        message = str(ctx.exception)
+        self.assertEqual(message, "render-local staging failed")
+        self.assertIsInstance(ctx.exception.__cause__, OSError)
+        for canary in canaries:
+            self.assertNotIn(canary, message)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.storage_root,
+                                        self.KNOWN_TASK_ID))
+        )
+        self.assertEqual(os.listdir(self.storage_root), [])
+        self.assertTrue(os.path.isdir(self.storage_root))
+        self.assertEqual(self.tree_snapshot(), before)
+
+    def test_rollback_on_script_write_failure(self):
+        loaded = self.make_loaded(
+            b"script CANARY-wf1", [("clip-CANARY-w1.mp4", b"m")]
+        )
+        os.makedirs(self.storage_root)
+
+        def boom(target, chunks):
+            raise OSError("injected write failure CANARY-writeinject")
+
+        before = self.tree_snapshot()
+        with patch.object(
+            pilot_prepare, "_atomic_write_stream", side_effect=boom
+        ), patch(
+            "shutil.rmtree",
+            side_effect=AssertionError("recursive deletion forbidden"),
+        ):
+            with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                pilot_prepare._stage_render_local_task(loaded)
+
+        self._assert_rollback_guarantees(
+            ctx,
+            before,
+            ("CANARY-wf1", "CANARY-w1", "CANARY-writeinject",
+             self.KNOWN_TASK_ID),
+        )
+
+    def test_rollback_on_hash_failure(self):
+        loaded = self.make_loaded(
+            b"script CANARY-hash1", [("clip-CANARY-h1.mp4", b"m")]
+        )
+        os.makedirs(self.storage_root)
+        before = self.tree_snapshot()
+        with patch(
+            "app.services.provenance.sha256_file_streamed",
+            side_effect=OSError("injected hash failure CANARY-hashinject"),
+        ), patch(
+            "shutil.rmtree",
+            side_effect=AssertionError("recursive deletion forbidden"),
+        ):
+            with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                pilot_prepare._stage_render_local_task(loaded)
+
+        self._assert_rollback_guarantees(
+            ctx,
+            before,
+            ("CANARY-hash1", "CANARY-h1", "CANARY-hashinject",
+             self.KNOWN_TASK_ID),
+        )
 
 
 if __name__ == "__main__":

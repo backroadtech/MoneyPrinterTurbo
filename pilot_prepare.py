@@ -47,6 +47,7 @@ import codecs
 import os
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -180,6 +181,19 @@ class RenderLocalLoadedInputs:
     script_bytes: bytes
     script_text: str
     material_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RenderLocalStagedTask:
+    """Task-local staged copies and hashes for a validated render request."""
+
+    loaded: RenderLocalLoadedInputs
+    task_id: str
+    task_dir: str
+    script_path: str
+    script_sha256: str
+    script_text: str
+    materials: tuple[tuple[str, str], ...]
 
 
 def _require_pilot_policy():
@@ -363,6 +377,121 @@ def _load_render_local_inputs(
         script_text=script_text,
         material_paths=tuple(material_paths),
     )
+
+
+_STAGING_COPY_CHUNK_SIZE = 1024 * 1024  # 1 MiB, mirrors provenance streaming
+
+
+def _atomic_write_stream(target: str, chunks) -> None:
+    """Write chunks to target via a same-directory temp file + os.replace.
+
+    Follows the provenance.write_manifest_atomic pattern: the temporary
+    file lives in the target directory so os.replace is an atomic rename
+    on the same filesystem, and the temp file is removed on any failure.
+    """
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target)}.",
+        suffix=".tmp",
+        dir=os.path.dirname(target),
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            for chunk in chunks:
+                handle.write(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _stage_render_local_task(
+    loaded: RenderLocalLoadedInputs,
+) -> RenderLocalStagedTask:
+    """Stage validated local inputs into a fresh confined task directory.
+
+    Creates storage/tasks/<task-id>/ plus a materials/ child, writes the
+    exact validated script bytes to script.md, streams each validated
+    material to materials/<basename>, and hashes only the task-local
+    copies with the production streaming SHA-256 helper. External source
+    paths are read for copying but never hashed or recorded. On any
+    failure, removes only files and directories created by this
+    invocation, in reverse order, using unlink/rmdir only (never
+    recursive deletion). All PrepareError messages are static and never
+    echo supplied paths or content; native failures are chained only as
+    internal causes.
+    """
+    from app.services import provenance as prov
+    from app.utils import utils
+
+    task_id = utils.get_uuid()
+    module_root = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
+    storage_root = os.path.join(module_root, "storage", "tasks")
+
+    created: list[tuple[str, str]] = []  # ("dir" | "file", path), in order
+    try:
+        if not os.path.isdir(storage_root):
+            storage_parent = os.path.dirname(storage_root)
+            parent_missing = not os.path.isdir(storage_parent)
+            os.makedirs(storage_root)
+            if parent_missing:
+                created.append(("dir", storage_parent))
+            created.append(("dir", storage_root))
+
+        task_dir = prov.resolve_task_path(storage_root, task_id,
+                                          must_exist=False)
+        try:
+            os.mkdir(task_dir)
+        except FileExistsError as exc:
+            raise PrepareError(
+                "render-local staging task directory already exists"
+            ) from exc
+        created.append(("dir", task_dir))
+        materials_dir = os.path.join(task_dir, "materials")
+        os.mkdir(materials_dir)
+        created.append(("dir", materials_dir))
+
+        script_target = os.path.join(task_dir, "script.md")
+        _atomic_write_stream(script_target, (loaded.script_bytes,))
+        created.append(("file", script_target))
+        script_sha256 = prov.sha256_file_streamed(script_target)
+
+        staged_materials = []
+        for source in loaded.material_paths:
+            target = os.path.join(materials_dir, os.path.basename(source))
+            with open(source, "rb") as handle:
+                _atomic_write_stream(
+                    target,
+                    iter(lambda: handle.read(_STAGING_COPY_CHUNK_SIZE), b""),
+                )
+            created.append(("file", target))
+            staged_materials.append((target, prov.sha256_file_streamed(target)))
+
+        return RenderLocalStagedTask(
+            loaded=loaded,
+            task_id=task_id,
+            task_dir=task_dir,
+            script_path=script_target,
+            script_sha256=script_sha256,
+            script_text=loaded.script_text,
+            materials=tuple(staged_materials),
+        )
+    except Exception as exc:
+        for kind, path in reversed(created):
+            try:
+                if kind == "file":
+                    os.unlink(path)
+                else:
+                    os.rmdir(path)
+            except OSError:
+                pass
+        if isinstance(exc, PrepareError):
+            raise
+        raise PrepareError("render-local staging failed") from exc
 
 
 def _resolve_and_confine(task_dir: str, raw_path: str, *, must_exist: bool,
