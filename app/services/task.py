@@ -28,6 +28,7 @@ from app.services import (
     volcengine_seedance,
     voice,
 )
+from app.services import pilot_policy
 from app.services import upload_post
 from app.services import state as sm
 from app.utils import file_security, utils
@@ -47,6 +48,24 @@ _cross_post_max_pending_tasks = max(
 _cross_post_slots = threading.BoundedSemaphore(_cross_post_max_pending_tasks)
 _cross_post_registry_lock = threading.RLock()
 _cross_post_futures: dict[str, Future] = {}
+
+
+def _cross_posting_enabled() -> bool:
+    """Return whether deferred cross-posting may run for this task.
+
+    An active BrainTrustCrypto pilot policy decides publishing is disabled
+    BEFORE any upload_post service property or method is consulted: the
+    service's fail-closed gates raise on access in pilot mode, so touching
+    the service here would fail an otherwise complete render. get_pilot_policy()
+    returns None when the pilot profile is inactive (confirmed contract in
+    app.services.pilot_policy). Non-pilot behavior (configured service plus
+    auto_upload) is unchanged.
+    """
+    return (
+        pilot_policy.get_pilot_policy() is None
+        and upload_post.upload_post_service.is_configured()
+        and upload_post.upload_post_service.auto_upload
+    )
 _cross_post_process_owner = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex}"
 _ACTIVE_CROSS_POST_STATES = {
     const.CROSS_POST_STATE_PENDING,
@@ -1449,10 +1468,7 @@ def _run_pipeline(
 
     # 7. 先完成视频生成任务，再按需提交跨平台发布。第三方上传可能耗时
     # 数分钟，不应阻塞视频结果返回，也不能反向影响已经生成的成片。
-    cross_post_enabled = (
-        upload_post.upload_post_service.is_configured()
-        and upload_post.upload_post_service.auto_upload
-    )
+    cross_post_enabled = _cross_posting_enabled()
     platforms = (
         list(upload_post.upload_post_service.platforms) if cross_post_enabled else []
     )

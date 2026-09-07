@@ -546,3 +546,168 @@ class TestSafeCLIInitialization:
         )
         assert result.returncode == 0
         assert "Generate MoneyPrinterTurbo videos" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# L4A — pilot cross-posting skip
+# ---------------------------------------------------------------------------
+
+
+class _ExplodingUploadService:
+    """Raise on any consultation — proves the upload_post service is never
+    touched when a pilot policy is active."""
+
+    def __getattr__(self, name):
+        raise AssertionError(
+            f"upload_post service consulted during pilot render: {name}"
+        )
+
+
+def _active_pilot_policy(monkeypatch):
+    """Install a real, validated PilotPolicy as the active pilot policy."""
+    import tomllib
+
+    from app.services.pilot_policy import PilotPolicy
+
+    policy = PilotPolicy(
+        tomllib.loads(_valid_policy()), policy_path="test-hardening.toml"
+    )
+    monkeypatch.setattr(
+        "app.services.pilot_policy.get_pilot_policy", lambda: policy
+    )
+    return policy
+
+
+def _inactive_pilot_policy(monkeypatch):
+    """Force the pilot-inactive contract: get_pilot_policy() returns None."""
+    monkeypatch.setattr("app.services.pilot_policy.get_pilot_policy", lambda: None)
+
+
+class TestPilotCrossPostingSkip:
+    """L4A — a pilot render must skip cross-posting before consulting upload_post.
+
+    Confirms:
+    1. An active pilot policy decides cross-posting is disabled before any
+       upload_post service property or method is consulted.
+    2. cross_post_state stays None and the pipeline reaches
+       TASK_STATE_COMPLETE with an active pilot policy.
+    3. Non-pilot cross-post decisions (configured service + auto_upload)
+       are unchanged.
+    4. get_pilot_policy() returns None when the profile is inactive — the
+       contract the decision relies on.
+    """
+
+    def test_get_pilot_policy_returns_none_when_profile_inactive(self, monkeypatch):
+        from app.services.pilot_policy import (
+            get_pilot_policy,
+            reset_pilot_policy_cache,
+        )
+
+        monkeypatch.delenv("MPT_PILOT_PROFILE", raising=False)
+        reset_pilot_policy_cache()
+        try:
+            assert get_pilot_policy() is None
+        finally:
+            reset_pilot_policy_cache()
+
+    def test_pilot_active_decides_disabled_before_consulting_service(
+        self, monkeypatch
+    ):
+        from app.services import task as task_module
+
+        _active_pilot_policy(monkeypatch)
+        monkeypatch.setattr(
+            "app.services.upload_post.upload_post_service",
+            _ExplodingUploadService(),
+        )
+
+        assert task_module._cross_posting_enabled() is False
+
+    def test_non_pilot_configured_service_keeps_existing_decision(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from app.services import task as task_module
+
+        _inactive_pilot_policy(monkeypatch)
+        service = MagicMock()
+        service.is_configured.return_value = True
+        service.auto_upload = True
+        monkeypatch.setattr("app.services.upload_post.upload_post_service", service)
+
+        assert task_module._cross_posting_enabled() is True
+        service.is_configured.assert_called_once_with()
+
+    def test_non_pilot_unconfigured_service_keeps_existing_decision(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from app.services import task as task_module
+
+        _inactive_pilot_policy(monkeypatch)
+        service = MagicMock()
+        service.is_configured.return_value = False
+        service.auto_upload = True
+        monkeypatch.setattr("app.services.upload_post.upload_post_service", service)
+
+        assert task_module._cross_posting_enabled() is False
+        service.is_configured.assert_called_once_with()
+
+    def test_pilot_pipeline_completes_without_consulting_upload_service(
+        self, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        from app.services import task as task_module
+
+        _active_pilot_policy(monkeypatch)
+        monkeypatch.setattr(
+            "app.services.upload_post.upload_post_service",
+            _ExplodingUploadService(),
+        )
+
+        monkeypatch.setattr(
+            task_module, "generate_script", lambda *a, **k: "proof script"
+        )
+        monkeypatch.setattr(task_module, "save_script_data", lambda *a, **k: None)
+        monkeypatch.setattr(
+            task_module,
+            "generate_audio",
+            lambda *a, **k: ("audio.mp3", 17.68, None),
+        )
+        monkeypatch.setattr(task_module, "generate_subtitle", lambda *a, **k: None)
+        monkeypatch.setattr(
+            task_module, "get_video_materials", lambda *a, **k: ["material-1"]
+        )
+        monkeypatch.setattr(
+            task_module,
+            "generate_final_videos",
+            lambda *a, **k: (["final-1.mp4"], ["combined-1.mp4"], []),
+        )
+
+        class _RecordingState:
+            def __init__(self):
+                self.updates = []
+
+            def update_task(self, task_id, **kwargs):
+                self.updates.append(kwargs)
+
+        recording = _RecordingState()
+        monkeypatch.setattr(task_module.sm, "state", recording)
+
+        params = SimpleNamespace(
+            video_source="local",
+            bgm_type="none",
+            bgm_volume=0.0,
+            video_concat_mode=None,
+        )
+        result = task_module._run_pipeline("l4a-test-task", params, stop_at="video")
+
+        assert result["videos"] == ["final-1.mp4"]
+        assert result["cross_post_state"] is None
+        assert result["cross_post_results"] is None
+        completions = [
+            update
+            for update in recording.updates
+            if update.get("state") == task_module.const.TASK_STATE_COMPLETE
+        ]
+        assert completions, "pipeline never reached TASK_STATE_COMPLETE"
+        assert completions[-1].get("progress") == 100
