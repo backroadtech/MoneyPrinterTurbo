@@ -1341,5 +1341,355 @@ class TestRenderLocalTaskStaging(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Render-local draft preparation (output-null manifest, durable write)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderLocalDraftPreparation(_PrepareTestBase):
+    """Focused tests for _prepare_render_local_draft.
+
+    Uses the real validation/loading/staging helpers inside an isolated
+    temporary storage root (pilot_prepare.__file__ points at the sandbox;
+    utils.get_uuid returns a known canonical UUID).
+    """
+
+    KNOWN_TASK_ID = "12345678-1234-5678-1234-567812345678"
+
+    def setUp(self):
+        super().setUp()
+        self.storage_root = os.path.join(self.root, "storage", "tasks")
+        self._file_patch = patch.object(
+            pilot_prepare,
+            "__file__",
+            os.path.join(self.root, "pilot_prepare.py"),
+        )
+        self._file_patch.start()
+        self._uuid_patch = patch(
+            "app.utils.utils.get_uuid", return_value=self.KNOWN_TASK_ID
+        )
+        self._uuid_patch.start()
+
+    def tearDown(self):
+        self._uuid_patch.stop()
+        self._file_patch.stop()
+        super().tearDown()
+
+    # -- fixture helpers ----------------------------------------------------
+
+    def write_source(self, name: str, data: bytes) -> str:
+        path = os.path.join(self.root, "src", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def run_chain(self, script_bytes, materials, claims=()):
+        """Real validate -> load -> stage chain against sandbox sources."""
+        script_src = self.write_source("script.txt", script_bytes)
+        material_paths = [
+            self.write_source(name, data) for name, data in materials
+        ]
+        request = pilot_prepare._validate_render_local_request(
+            topic="draft topic",
+            script_path=script_src,
+            material_paths=material_paths,
+            license_names=[f"license-{i}" for i in range(len(materials))],
+            license_evidence=[f"evidence-{i}" for i in range(len(materials))],
+            claims=[text for text, _ in claims],
+            claim_sources=[source for _, source in claims],
+        )
+        loaded = pilot_prepare._load_render_local_inputs(request)
+        return pilot_prepare._stage_render_local_task(loaded)
+
+    def tree_snapshot(self):
+        dirs = set()
+        files = {}
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            for dirname in dirnames:
+                dirs.add(os.path.relpath(os.path.join(dirpath, dirname),
+                                         self.root))
+            for filename in filenames:
+                full = os.path.join(dirpath, filename)
+                with open(full, "rb") as handle:
+                    files[os.path.relpath(full, self.root)] = handle.read()
+        return dirs, files
+
+    # -- 1/2. happy path and successful preservation --------------------------
+
+    def test_happy_path_writes_durable_output_null_manifest(self):
+        script_bytes = "Draft script\r\ncafé 中文\r\n".encode("utf-8")
+        claims = (("Bitcoin supply is capped at 21 million.",
+                   "https://bitcoin.org/bitcoin.pdf"),)
+        staged = self.run_chain(
+            script_bytes,
+            [("clip-b.mp4", b"bytes-b"), ("clip-a.mp4", b"bytes-a")],
+            claims=claims,
+        )
+        forbidden_prefixes = (
+            "app.services.task",
+            "app.services.llm",
+            "app.services.voice",
+            "app.services.material",
+            "app.services.video",
+            "app.services.upload_post",
+            "app.services.version_checker",
+            "app.controllers",
+            "app.services.egress",
+        )
+        before_modules = {
+            n for n in sys.modules if n.startswith(forbidden_prefixes)
+        }
+
+        draft = pilot_prepare._prepare_render_local_draft(staged)
+
+        after_modules = {
+            n for n in sys.modules if n.startswith(forbidden_prefixes)
+        }
+        self.assertEqual(after_modules - before_modules, set())
+        self.assertIs(draft.staged, staged)
+        self.assertEqual(
+            draft.manifest_path,
+            os.path.join(staged.task_dir, "provenance_manifest.json"),
+        )
+        self.assertTrue(os.path.isfile(draft.manifest_path))
+        # Production validation accepts the durable manifest.
+        prov.validate_manifest(draft.manifest)
+
+        task = draft.manifest["task"]
+        self.assertEqual(task["schema_version"], "1.2.0")
+        self.assertEqual(task["review_status"], "NEEDS_HUMAN_REVIEW")
+        self.assertIsNone(draft.manifest["output"])
+
+        script_section = draft.manifest["script"]
+        self.assertEqual(script_section["local_path"], "script.md")
+        self.assertEqual(script_section["sha256"], staged.script_sha256)
+        self.assertEqual(
+            script_section["sha256"],
+            hashlib.sha256(script_bytes).hexdigest(),
+        )
+
+        assets = draft.manifest["assets"]
+        self.assertEqual(len(assets), 2)
+        for index, asset in enumerate(assets):
+            self.assertEqual(asset["asset_type"], "video")
+            self.assertEqual(asset["source_type"], "local")
+            self.assertEqual(
+                asset["local_path"],
+                os.path.join("materials", ("clip-b.mp4",
+                                           "clip-a.mp4")[index]),
+            )
+            self.assertEqual(asset["sha256"], staged.materials[index][1])
+            self.assertEqual(
+                asset["sha256"],
+                hashlib.sha256((b"bytes-b", b"bytes-a")[index]).hexdigest(),
+            )
+            # Exact per-material license pairing and ordering.
+            self.assertEqual(asset["license_name"], f"license-{index}")
+            self.assertEqual(
+                asset["license_evidence"], f"evidence-{index}"
+            )
+
+        factual_claims = draft.manifest["factual_claims"]
+        self.assertEqual(len(factual_claims), 1)
+        self.assertEqual(factual_claims[0]["status"], "UNVERIFIED")
+        self.assertEqual(
+            factual_claims[0]["claim_id"],
+            prov.generate_claim_id(
+                task_id=self.KNOWN_TASK_ID,
+                ordinal=0,
+                claim_text=claims[0][0],
+                source_url=claims[0][1],
+            ),
+        )
+
+        # Draft tree is complete; no output video files exist.
+        staged_files = []
+        for dirpath, _, filenames in os.walk(staged.task_dir):
+            for filename in filenames:
+                staged_files.append(
+                    os.path.relpath(os.path.join(dirpath, filename),
+                                    staged.task_dir)
+                )
+        self.assertEqual(
+            sorted(staged_files),
+            [
+                os.path.join("materials", "clip-a.mp4"),
+                os.path.join("materials", "clip-b.mp4"),
+                "provenance_manifest.json",
+                "script.md",
+            ],
+        )
+
+    def test_successful_draft_preserves_tree_sources_and_parents(self):
+        script_bytes = b"preserve me"
+        staged = self.run_chain(
+            script_bytes, [("clip-CANARY-p1.mp4", b"source-bytes")]
+        )
+        draft = pilot_prepare._prepare_render_local_draft(staged)
+        after_return = self.tree_snapshot()
+
+        # Complete draft tree remains after return.
+        self.assertTrue(os.path.isfile(draft.manifest_path))
+        with open(staged.script_path, "rb") as handle:
+            self.assertEqual(handle.read(), script_bytes)
+        with open(staged.materials[0][0], "rb") as handle:
+            self.assertEqual(handle.read(), b"source-bytes")
+        # External source files remain byte-for-byte unchanged.
+        with open(os.path.join(self.root, "src", "script.txt"), "rb") as h:
+            self.assertEqual(h.read(), script_bytes)
+        with open(
+            os.path.join(self.root, "src", "clip-CANARY-p1.mp4"), "rb"
+        ) as h:
+            self.assertEqual(h.read(), b"source-bytes")
+        # Storage parents remain; only the generated task dir was added.
+        self.assertTrue(os.path.isdir(self.storage_root))
+        self.assertEqual(os.listdir(self.storage_root), [self.KNOWN_TASK_ID])
+        self.assertEqual(self.tree_snapshot(), after_return)
+
+    # -- 3. injected failures with full owned-path rollback -------------------
+
+    def _assert_failure_rollback(self, ctx, before, expected_message,
+                                 canaries):
+        message = str(ctx.exception)
+        self.assertEqual(message, expected_message)
+        for canary in canaries:
+            self.assertNotIn(canary, message)
+        task_dir = os.path.join(self.storage_root, self.KNOWN_TASK_ID)
+        self.assertFalse(os.path.exists(task_dir))
+        self.assertEqual(os.listdir(self.storage_root), [])
+        self.assertTrue(os.path.isdir(self.storage_root))
+        self.assertEqual(self.tree_snapshot(), before)
+
+    def _run_failure_case(self, patcher, expected_message, extra_canaries):
+        script_bytes = b"script CANARY-f0"
+        script_src = self.write_source("script.txt", script_bytes)
+        material_src = self.write_source("clip-CANARY-f1.mp4", b"m-bytes")
+        os.makedirs(self.storage_root)
+        # True pre-staging baseline: only external source fixtures and the
+        # intentionally pre-existing storage/tasks parents exist.
+        before = self.tree_snapshot()
+        request = pilot_prepare._validate_render_local_request(
+            topic="draft topic",
+            script_path=script_src,
+            material_paths=[material_src],
+            license_names=["license-0"],
+            license_evidence=["evidence-0"],
+        )
+        loaded = pilot_prepare._load_render_local_inputs(request)
+        staged = pilot_prepare._stage_render_local_task(loaded)
+        with patcher, patch(
+            "shutil.rmtree",
+            side_effect=AssertionError("recursive deletion forbidden"),
+        ):
+            with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                pilot_prepare._prepare_render_local_draft(staged)
+        self._assert_failure_rollback(
+            ctx,
+            before,
+            expected_message,
+            ("CANARY-f0", "CANARY-f1", self.KNOWN_TASK_ID, script_src,
+             material_src) + extra_canaries,
+        )
+        return ctx
+
+    def test_script_hash_mismatch_rolls_back(self):
+        real_builder = prov.build_script_section
+
+        def wrong_hash(task_dir, **kwargs):
+            section = real_builder(task_dir, **kwargs)
+            section["sha256"] = "0" * 64
+            return section
+
+        patcher = patch(
+            "app.services.provenance.build_script_section",
+            side_effect=wrong_hash,
+        )
+        ctx = self._run_failure_case(
+            patcher, "render-local staged script hash mismatch", ()
+        )
+        self.assertIsNone(ctx.exception.__cause__)
+
+    def test_material_hash_mismatch_rolls_back(self):
+        real_builder = prov.build_asset
+
+        def wrong_hash(task_dir, **kwargs):
+            asset = real_builder(task_dir, **kwargs)
+            asset["sha256"] = "0" * 64
+            return asset
+
+        patcher = patch(
+            "app.services.provenance.build_asset", side_effect=wrong_hash
+        )
+        ctx = self._run_failure_case(
+            patcher, "render-local staged material hash mismatch", ()
+        )
+        self.assertIsNone(ctx.exception.__cause__)
+
+    def test_manifest_build_failure_rolls_back(self):
+        patcher = patch(
+            "app.services.provenance.build_manifest",
+            side_effect=prov.ProvenanceError("injected CANARY-build"),
+        )
+        ctx = self._run_failure_case(
+            patcher,
+            "render-local draft preparation failed",
+            ("CANARY-build",),
+        )
+        self.assertIsInstance(ctx.exception.__cause__, prov.ProvenanceError)
+
+    def test_manifest_write_failure_rolls_back(self):
+        patcher = patch(
+            "app.services.provenance.write_manifest_atomic",
+            side_effect=OSError("injected CANARY-write"),
+        )
+        ctx = self._run_failure_case(
+            patcher,
+            "render-local draft preparation failed",
+            ("CANARY-write",),
+        )
+        self.assertIsInstance(ctx.exception.__cause__, OSError)
+
+    def test_durable_validation_failure_rolls_back(self):
+        real_validate = prov.validate_manifest
+        calls = []
+
+        def flaky(manifest):
+            calls.append(1)
+            if len(calls) > 1:
+                raise prov.ProvenanceError("injected CANARY-validate")
+            return real_validate(manifest)
+
+        patcher = patch(
+            "app.services.provenance.validate_manifest", side_effect=flaky
+        )
+        ctx = self._run_failure_case(
+            patcher,
+            "render-local draft preparation failed",
+            ("CANARY-validate",),
+        )
+        self.assertIsInstance(ctx.exception.__cause__, prov.ProvenanceError)
+
+    # -- 4. rollback helper ---------------------------------------------------
+
+    def test_rollback_tolerates_absent_owned_paths(self):
+        staged = self.run_chain(b"script", [("clip.mp4", b"m")])
+        os.unlink(staged.script_path)
+        os.unlink(staged.materials[0][0])
+        os.rmdir(os.path.join(staged.task_dir, "materials"))
+        pilot_prepare._rollback_staged_task(staged)  # must not raise
+        self.assertFalse(os.path.exists(staged.task_dir))
+
+    def test_rollback_never_removes_preexisting_parent(self):
+        os.makedirs(self.storage_root)
+        staged = self.run_chain(b"script", [("clip.mp4", b"m")])
+        self.assertNotIn(
+            ("dir", self.storage_root), list(staged.created_paths)
+        )
+        pilot_prepare._rollback_staged_task(staged)
+        self.assertTrue(os.path.isdir(self.storage_root))
+        self.assertEqual(os.listdir(self.storage_root), [])
+
+
 if __name__ == "__main__":
     unittest.main()

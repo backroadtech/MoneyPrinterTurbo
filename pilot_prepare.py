@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import json
 import os
 import re
 import sys
@@ -185,7 +186,7 @@ class RenderLocalLoadedInputs:
 
 @dataclass(frozen=True)
 class RenderLocalStagedTask:
-    """Task-local staged copies and hashes for a validated render request."""
+    """Task-local staged copies, hashes, and owned-path cleanup metadata."""
 
     loaded: RenderLocalLoadedInputs
     task_id: str
@@ -194,6 +195,18 @@ class RenderLocalStagedTask:
     script_sha256: str
     script_text: str
     materials: tuple[tuple[str, str], ...]
+    # ("dir" | "file", path) pairs in creation order. Only paths created by
+    # the staging invocation are recorded, including owned parent dirs.
+    created_paths: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class RenderLocalPreparedDraft:
+    """Staged task plus its durable output-null draft manifest."""
+
+    staged: RenderLocalStagedTask
+    manifest_path: str
+    manifest: dict
 
 
 def _require_pilot_policy():
@@ -479,19 +492,134 @@ def _stage_render_local_task(
             script_sha256=script_sha256,
             script_text=loaded.script_text,
             materials=tuple(staged_materials),
+            created_paths=tuple(created),
         )
     except Exception as exc:
-        for kind, path in reversed(created):
-            try:
-                if kind == "file":
-                    os.unlink(path)
-                else:
-                    os.rmdir(path)
-            except OSError:
-                pass
+        _rollback_created_paths(created)
         if isinstance(exc, PrepareError):
             raise
         raise PrepareError("render-local staging failed") from exc
+
+
+def _rollback_created_paths(created) -> None:
+    """Remove recorded created paths in reverse order, best effort.
+
+    Uses unlink/rmdir only (never recursive deletion) and tolerates
+    already-absent owned paths. Paths not recorded by the owning
+    invocation are never touched, so pre-existing parents and external
+    inputs are always preserved.
+    """
+    for kind, path in reversed(list(created)):
+        try:
+            if kind == "file":
+                os.unlink(path)
+            else:
+                os.rmdir(path)
+        except OSError:
+            pass
+
+
+def _rollback_staged_task(staged: RenderLocalStagedTask) -> None:
+    """Remove only the paths recorded as created by this staged task."""
+    _rollback_created_paths(staged.created_paths)
+
+
+def _prepare_render_local_draft(
+    staged: RenderLocalStagedTask,
+) -> RenderLocalPreparedDraft:
+    """Build and durably write the output-null draft manifest.
+
+    Reuses the Phase 1B.3A provenance builders end to end: task metadata
+    defaults to NEEDS_HUMAN_REVIEW, the script section comes from the
+    task-local script.md, one local video asset is built per staged
+    task-local material with its original license pairing and ordering,
+    claims stay UNVERIFIED with deterministic claim IDs, and output is
+    None. The manifest is written last via the atomic writer, then read
+    back and re-validated before returning. On any build, validation,
+    write, or durable-read failure the staged task is rolled back; only
+    a static sanitized PrepareError surfaces, with native details
+    chained solely as internal causes. Once the durable valid manifest
+    exists and is verified, the complete draft is preserved.
+    """
+    from app.services import provenance as prov
+
+    task_dir = staged.task_dir
+    manifest_target = os.path.join(task_dir, "provenance_manifest.json")
+    try:
+        task_section = prov.build_task_section(
+            task_id=staged.task_id,
+            topic=staged.loaded.request.topic,
+            pilot_profile="braintrustcrypto",
+        )
+        script_section = prov.build_script_section(
+            task_dir,
+            local_path="script.md",
+            generation_source="local",
+        )
+        if script_section["sha256"] != staged.script_sha256:
+            raise PrepareError("render-local staged script hash mismatch")
+
+        assets = []
+        request_materials = staged.loaded.request.materials
+        for index, (staged_path, staged_hash) in enumerate(staged.materials):
+            asset = prov.build_asset(
+                task_dir,
+                asset_type="video",
+                source_type="local",
+                local_path=os.path.relpath(staged_path, task_dir),
+                license_name=request_materials[index].license_name,
+                license_evidence=request_materials[index].license_evidence,
+            )
+            if asset["sha256"] != staged_hash:
+                raise PrepareError(
+                    "render-local staged material hash mismatch"
+                )
+            assets.append(asset)
+
+        claims = []
+        for index, (claim_text, source) in enumerate(
+            staged.loaded.request.claims
+        ):
+            claims.append(
+                prov.build_claim(
+                    claim_text=claim_text,
+                    source_url=source,
+                    status="UNVERIFIED",
+                    retrieval_date=prov.utc_now_iso(),
+                    claim_id=prov.generate_claim_id(
+                        task_id=staged.task_id,
+                        ordinal=index,
+                        claim_text=claim_text,
+                        source_url=source,
+                    ),
+                )
+            )
+
+        manifest = prov.build_manifest(
+            task=task_section,
+            script=script_section,
+            assets=assets,
+            factual_claims=claims,
+            output=None,
+        )
+        manifest_path = prov.write_manifest_atomic(task_dir, manifest)
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            durable = json.load(handle)
+        prov.validate_manifest(durable)
+        return RenderLocalPreparedDraft(
+            staged=staged,
+            manifest_path=manifest_path,
+            manifest=durable,
+        )
+    except Exception as exc:
+        try:
+            os.unlink(manifest_target)
+        except OSError:
+            pass
+        _rollback_staged_task(staged)
+        if isinstance(exc, PrepareError):
+            raise
+        raise PrepareError("render-local draft preparation failed") from exc
 
 
 def _resolve_and_confine(task_dir: str, raw_path: str, *, must_exist: bool,
