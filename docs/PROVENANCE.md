@@ -1,12 +1,12 @@
-# Provenance Manifest — Phase 1B.3A / 1B.3C.2A / 1B.3C.2B.2B
+# Provenance Manifest — Phase 1B.3A / 1B.3C.2A / 1B.3C.2B.2B / 1B.3C.2B.2C
 
 Offline provenance and human-review manifest foundation for BrainTrustCrypto
 pilot tasks.
 
-**Status:** foundation plus offline review-integrity primitives and schema
-1.2.0 claim IDs with transaction journal (Phase 1B.3C.2B.2B). This module is
-**not** integrated with rendering, providers, publishing, or review CLI
-commands. CLI integration is deferred to a later phase.
+**Status:** foundation plus offline review-integrity primitives, schema
+1.2.0 claim IDs with transaction journal (Phase 1B.3C.2B.2B), and crash-safe
+claim-transaction commands with deterministic resume (Phase 1B.3C.2B.2C).
+This module is **not** integrated with rendering, providers, or publishing.
 
 ## Purpose
 
@@ -234,21 +234,33 @@ primitives:
   file, then advance the checkpoint to it.
 
 Read-only `status` and `audit` CLI commands are available (Phase
-1B.3C.2B.1). Mutating review commands (verify-claim, retract-claim,
-resume-transaction) are deferred to Phase 1B.3C.2B.2C;
-approve/revoke/recover-lock/tail-recovery remain unexposed.
+1B.3C.2B.1). The mutating claim-transaction commands `verify-claim`,
+`retract-claim`, and `resume-transaction` are available (Phase
+1B.3C.2B.2C); approval, rejection, revocation, lock recovery, tail
+recovery, and publishing remain outside the exposed CLI scope.
 
 ## Transaction journal (Phase 1B.3C.2B.2B)
 
 `review-transaction.json` — an atomic, hash-verified journal for multi-step
 review transactions (verify-claim, retract-claim). The journal records
-exactly these 17 fields: `schema_version`, `transaction_id`, `operation`,
+exactly these 18 fields: `schema_version`, `transaction_id`, `operation`,
 `task_id`, `claim_id`, `starting_manifest_hash`, `proposed_manifest_hash`,
 `proposed_manifest_relative_path`, `snapshot_relative_path`,
 `expected_event_id`, `expected_event_hash`, `lock_token`,
 `transaction_stage`, `created_at_utc`, `original_reviewer_id`,
-`original_reviewer_display_name`, and `journal_hash`. Missing or unknown
-fields fail closed.
+`original_reviewer_display_name`, `claim_notes`, and `journal_hash`.
+Missing or unknown fields fail closed.
+
+`claim_notes` is a required, nullable string: the exact sanitized
+`--notes` value of a verify-claim transaction, the exact sanitized
+`--reason` value of a retract-claim transaction, or `null`. It is covered
+by `journal_hash` and, like every field except `transaction_stage`, is
+immutable across stage advances. At resume load, a non-null `claim_notes`
+is re-checked against the current secret patterns after structural and
+self-hash validation and before any use; a violation fails closed
+`TRANSACTION_JOURNAL_CORRUPT` before any write (`null` carries no content
+and is skipped). The value is never printed on any output surface or in
+any error message and is never included in recovery receipts.
 
 Stages (exactly eight, forward-only):
 
@@ -275,7 +287,74 @@ Rules:
 - `status` and `audit` remain byte-for-byte read-only; they never create,
   modify, or delete the journal.
 
-No claim mutation or transaction execution commands are exposed yet.
+## Claim-transaction commands and resume (Phase 1B.3C.2B.2C)
+
+`pilot_review.py` exposes five offline review commands, all confined to
+the task directory: `status`, `audit`, `verify-claim`, `retract-claim`,
+and `resume-transaction`. `status` and `audit` remain strictly read-only.
+
+`verify-claim` promotes one `UNVERIFIED` claim to `VERIFIED`
+(`--claim-id`, `--reviewer-id`, `--reviewer-display-name`, optional
+`--notes`). `retract-claim` marks one claim `RETRACTED` (mandatory
+`--reason`). Both execute one forward-only transaction across the eight
+journal stages: acquire the task lock, snapshot the starting manifest
+into `manifest-history/`, write the deterministic proposed manifest,
+create the planned `CLAIM_VERIFIED` or `CLAIM_RETRACTED` review event,
+advance the chain-head checkpoint, install the proposed manifest, and
+commit. The transaction reaches COMMITTED before final cleanup. Direct
+completion reconciles the lock before deleting the journal. Resume
+finalization reconciles the lock, creates or verifies the recovery
+receipt, and deletes the transaction journal last. An interruption
+leaves a legitimate journal at exactly one stage; `status` and `audit`
+then report `INCOMPLETE_TRANSACTION`, and further
+`verify-claim`/`retract-claim` commands refuse until the transaction is
+explicitly resumed. Completing a claim transaction never changes
+`review_status` and never approves anything: the task stays
+`NEEDS_HUMAN_REVIEW` until a separate human decision.
+
+`resume-transaction` (`--transaction-id`, `--reviewer-id`,
+`--reviewer-display-name`, `--reason`) is the only way forward. It writes
+nothing until every check passes, validating in order: the active
+manifest; journal presence and validity; the transaction-id argument
+shape and journal match; the resuming reviewer ID; the resuming reviewer
+display name; the reason; the pilot policy gate; the `claim_notes`
+secret re-check; and recorded-operation and immutable journal-identity
+consistency with the active manifest. Resume then continues strictly
+forward from the recorded stage — stages are never skipped, repeated, or
+reversed:
+
+- **Absent proposed-manifest temporary file** — the deterministic
+  proposed manifest is rebuilt from journal fields alone and proven
+  against the journal's `proposed_manifest_hash` before anything is
+  written.
+- **Exact valid temporary file** — reused byte-for-byte without
+  rewriting.
+- **Mismatched or ambiguous evidence** — including a durable proposed
+  manifest whose target-claim `notes` differ from the journal
+  `claim_notes` — fails closed `TRANSACTION_AMBIGUOUS`; the temporary
+  file is never deleted and never overwritten.
+
+The original transaction reviewer identity and timestamps are preserved:
+the installed claim and the committed review event carry the original
+reviewer and the original transaction timestamps, never the resuming
+reviewer or the resume time. The resuming reviewer and the new resume
+reason appear in exactly one place: an immutable recovery receipt at
+`review-recovery/transaction-resumed-<transaction_id>.json`. Receipt
+creation is create-or-verify — an existing receipt with exactly the
+expected content is verified, never rewritten. The transaction journal is
+deleted last, only after the receipt exists and validates.
+
+Before COMMITTED, resume requires the matching journal-recorded lock; a
+missing, foreign-token, or malformed lock fails closed without writes.
+At COMMITTED finalization, a matching lock is released and its absence
+verified, while an already-absent lock is accepted as previously
+reconciled. A foreign-token or malformed COMMITTED lock still fails
+closed. Recovery-receipt creation or verification follows lock
+reconciliation, and the transaction journal is deleted last only after
+the receipt exists and validates. Every command output and error
+message is static and sanitized:
+no `claim_notes` values, reasons, lock tokens, absolute paths, native
+exception text, or parser details ever appear on any surface.
 
 ## Review states and transitions
 
