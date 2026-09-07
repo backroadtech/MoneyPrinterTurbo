@@ -31,7 +31,10 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import pilot_prepare
+from app.models import const
+from app.models.schema import VideoAspect, VideoConcatMode
 from app.services import provenance as prov
+from app.services import voice
 from app.services.pilot_policy import reset_pilot_policy_cache
 
 VALID_POLICY = """
@@ -1689,6 +1692,784 @@ class TestRenderLocalDraftPreparation(_PrepareTestBase):
         pilot_prepare._rollback_staged_task(staged)
         self.assertTrue(os.path.isdir(self.storage_root))
         self.assertEqual(os.listdir(self.storage_root), [])
+
+
+# ---------------------------------------------------------------------------
+# Render-local verified render semantics (post-render evidence verification)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderLocalVerifiedRenderSemantics(_PrepareTestBase):
+    """Happy-path semantics for _verify_render_local_render.
+
+    Builds a real prepared draft with the validate/load/stage/draft helpers
+    inside an isolated temporary storage root (pilot_prepare.__file__ points
+    at the sandbox; utils.get_uuid returns a known canonical UUID), attaches
+    renderer-shaped evidence (script.json + final-1.mp4), and confirms a
+    successful completion task result verifies strictly read-only.
+    """
+
+    KNOWN_TASK_ID = "12345678-1234-5678-1234-567812345678"
+
+    def setUp(self):
+        super().setUp()
+        self._file_patch = patch.object(
+            pilot_prepare,
+            "__file__",
+            os.path.join(self.root, "pilot_prepare.py"),
+        )
+        self._file_patch.start()
+        self._uuid_patch = patch(
+            "app.utils.utils.get_uuid", return_value=self.KNOWN_TASK_ID
+        )
+        self._uuid_patch.start()
+
+    def tearDown(self):
+        self._uuid_patch.stop()
+        self._file_patch.stop()
+        super().tearDown()
+
+    # -- helpers ------------------------------------------------------------
+
+    def write_source(self, name: str, data: bytes) -> str:
+        path = os.path.join(self.root, "src", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def tree_snapshot(self, root):
+        dirs = set()
+        files = {}
+        for dirpath, dirnames, filenames in os.walk(root):
+            for dirname in dirnames:
+                dirs.add(
+                    os.path.relpath(os.path.join(dirpath, dirname), root)
+                )
+            for filename in filenames:
+                full = os.path.join(dirpath, filename)
+                with open(full, "rb") as handle:
+                    files[os.path.relpath(full, root)] = handle.read()
+        return dirs, files
+
+    # -- shared fixtures ------------------------------------------------------
+
+    def build_verifiable_fixtures(self):
+        """Real prepared draft plus renderer-shaped script.json/final-1.mp4.
+
+        Runs the validate/load/stage/draft helpers under isolated temporary
+        storage, then attaches the fixture-shaped post-render evidence the
+        verifier consumes. Returns (draft, script_json_target,
+        script_json_fixture, output_target, output_bytes).
+        """
+        script_bytes = b"Bitcoin basics verified render script.\n"
+        material_specs = [
+            ("clip-b.mp4", b"material-bytes-b"),
+            ("clip-a.mp4", b"material-bytes-a"),
+        ]
+
+        # 1. Real prepared draft via the validate/load/stage/draft helpers
+        #    under isolated temporary storage.
+        script_src = self.write_source("script.txt", script_bytes)
+        material_srcs = [
+            self.write_source(name, data) for name, data in material_specs
+        ]
+        request = pilot_prepare._validate_render_local_request(
+            topic="verified render topic",
+            script_path=script_src,
+            material_paths=material_srcs,
+            license_names=["CC0", "ODbL"],
+            license_evidence=["ref-b", "ref-a"],
+        )
+        loaded = pilot_prepare._load_render_local_inputs(request)
+        staged = pilot_prepare._stage_render_local_task(loaded)
+        draft = pilot_prepare._prepare_render_local_draft(staged)
+        task_dir = staged.task_dir
+
+        # 2. Fixture-shaped script.json: exact prepared script + fixed params.
+        script_json_fixture = {
+            "script": staged.script_text,
+            "params": {
+                "video_script": staged.script_text,
+                "video_source": "local",
+                "video_count": 1,
+                "video_aspect": VideoAspect.landscape.value,
+                "video_concat_mode": VideoConcatMode.sequential.value,
+                "video_clip_duration": 5,
+                "voice_name": voice.NO_VOICE_NAME,
+                "subtitle_enabled": False,
+                "bgm_type": "none",
+                "video_materials": [
+                    {
+                        "provider": "local",
+                        "url": os.path.relpath(staged_path, task_dir),
+                    }
+                    for staged_path, _ in staged.materials
+                ],
+            },
+        }
+        script_json_target = os.path.join(task_dir, "script.json")
+        with open(script_json_target, "w", encoding="utf-8") as handle:
+            json.dump(script_json_fixture, handle)
+
+        # 3. One final-1.mp4 fixture with known bytes.
+        output_bytes = b"known-final-video-bytes\x00\x01\x02\xff"
+        output_target = os.path.join(task_dir, "final-1.mp4")
+        with open(output_target, "wb") as handle:
+            handle.write(output_bytes)
+
+        return (
+            draft,
+            script_json_target,
+            script_json_fixture,
+            output_target,
+            output_bytes,
+        )
+
+    # -- happy path -----------------------------------------------------------
+
+    def test_verified_render_happy_path(self):
+        (
+            draft,
+            script_json_target,
+            script_json_fixture,
+            output_target,
+            output_bytes,
+        ) = self.build_verifiable_fixtures()
+        staged = draft.staged
+        task_dir = staged.task_dir
+
+        # 4. Successful TASK_STATE_COMPLETE / progress-100 task result.
+        task_result = {
+            "task_id": staged.task_id,
+            "state": const.TASK_STATE_COMPLETE,
+            "progress": 100,
+            "videos": [os.path.relpath(output_target, task_dir)],
+        }
+
+        before_tree = self.tree_snapshot(task_dir)
+        verified = pilot_prepare._verify_render_local_render(
+            draft, task_result
+        )
+
+        # Returned draft identity.
+        self.assertIs(verified.draft, draft)
+        self.assertIs(verified.draft.staged, staged)
+
+        # script.json path and data.
+        self.assertEqual(
+            verified.script_json_path,
+            os.path.realpath(os.path.abspath(script_json_target)),
+        )
+        self.assertEqual(verified.script_json, script_json_fixture)
+
+        # Final output path.
+        self.assertEqual(
+            verified.output_path,
+            os.path.realpath(os.path.abspath(output_target)),
+        )
+        self.assertTrue(os.path.isfile(verified.output_path))
+
+        # Production and independent SHA-256 agree.
+        self.assertEqual(
+            verified.output_sha256,
+            prov.sha256_file_streamed(verified.output_path),
+        )
+        self.assertEqual(
+            verified.output_sha256,
+            hashlib.sha256(output_bytes).hexdigest(),
+        )
+
+        # Complete task tree is byte-for-byte unchanged by verification.
+        self.assertEqual(self.tree_snapshot(task_dir), before_tree)
+
+        # Returned dataclass is immutable.
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            verified.output_sha256 = "mutated"
+
+    # -- optional task-result fields ------------------------------------------
+
+    def test_task_result_optional_fields_absent_are_accepted(self):
+        (
+            draft,
+            _script_json_target,
+            _script_json_fixture,
+            output_target,
+            output_bytes,
+        ) = self.build_verifiable_fixtures()
+        task_dir = draft.staged.task_dir
+
+        # Only the required completion-contract fields are present; task_id
+        # and videos are genuinely optional under the implemented contract.
+        task_result = {
+            "state": const.TASK_STATE_COMPLETE,
+            "progress": 100,
+        }
+        before_tree = self.tree_snapshot(task_dir)
+        verified = pilot_prepare._verify_render_local_render(
+            draft, task_result
+        )
+
+        self.assertIs(verified.draft, draft)
+        self.assertEqual(
+            verified.output_path,
+            os.path.realpath(os.path.abspath(output_target)),
+        )
+        self.assertEqual(
+            verified.output_sha256,
+            prov.sha256_file_streamed(verified.output_path),
+        )
+        self.assertEqual(
+            verified.output_sha256,
+            hashlib.sha256(output_bytes).hexdigest(),
+        )
+        self.assertEqual(verified.task_result, task_result)
+        self.assertEqual(self.tree_snapshot(task_dir), before_tree)
+
+    # -- task-result refusals -------------------------------------------------
+
+    def test_incomplete_or_mismatched_task_result_refused(self):
+        (
+            draft,
+            _script_json_target,
+            _script_json_fixture,
+            output_target,
+            _output_bytes,
+        ) = self.build_verifiable_fixtures()
+        task_dir = draft.staged.task_dir
+        output_rel = os.path.relpath(output_target, task_dir)
+        foreign_path = os.path.join(self.root, "foreign-CANARY-vfr.mp4")
+        remote_url = "https://example.com/CANARY-vru/final-1.mp4"
+        wrong_task_id = "canary-task-id-CANARY-vtid"
+
+        success = {
+            "state": const.TASK_STATE_COMPLETE,
+            "progress": 100,
+        }
+        disagree = (
+            "render-local task result outputs disagree with the prepared "
+            "draft"
+        )
+        cases = [
+            ("non-mapping result",
+             "not-a-mapping-CANARY-vnm",
+             "render-local task result must be a non-empty mapping",
+             ("not-a-mapping-CANARY-vnm",)),
+            ("empty mapping",
+             {},
+             "render-local task result must be a non-empty mapping",
+             ()),
+            # A failed task that left final-1.mp4 behind never qualifies.
+            ("failure state with valid output",
+             {**success, "state": const.TASK_STATE_FAILED},
+             "render-local task result state is not complete",
+             ()),
+            ("incomplete progress",
+             {**success, "progress": 50},
+             "render-local task result progress is not complete",
+             ()),
+            ("mismatched task id",
+             {**success, "task_id": wrong_task_id},
+             "render-local task result task ID disagrees with the prepared "
+             "draft",
+             (wrong_task_id, self.KNOWN_TASK_ID)),
+            ("videos present but empty",
+             {**success, "videos": []},
+             disagree,
+             ()),
+            ("videos present with extra entries",
+             {**success, "videos": [output_rel, "extra-CANARY-vex.mp4"]},
+             disagree,
+             ("extra-CANARY-vex.mp4",)),
+            ("videos present with a foreign path",
+             {**success, "videos": [foreign_path]},
+             disagree,
+             (foreign_path,)),
+            ("videos present with a remote URL",
+             {**success, "videos": [remote_url]},
+             disagree,
+             (remote_url,)),
+        ]
+        for name, task_result, expected_message, leaked in cases:
+            with self.subTest(case=name):
+                before_tree = self.tree_snapshot(task_dir)
+                with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                    pilot_prepare._verify_render_local_render(
+                        draft, task_result
+                    )
+                message = str(ctx.exception)
+                self.assertEqual(message, expected_message)
+                for supplied in leaked:
+                    self.assertNotIn(supplied, message)
+                self.assertEqual(self.tree_snapshot(task_dir), before_tree)
+
+    # -- script / fixed render-parameter drift refusals -----------------------
+
+    def test_script_or_fixed_render_parameter_drift_refused(self):
+        (
+            draft,
+            script_json_target,
+            script_json_fixture,
+            output_target,
+            _output_bytes,
+        ) = self.build_verifiable_fixtures()
+        staged = draft.staged
+        task_dir = staged.task_dir
+        # Task result and final-1.mp4 stay otherwise valid in every subtest.
+        task_result = {
+            "task_id": staged.task_id,
+            "state": const.TASK_STATE_COMPLETE,
+            "progress": 100,
+            "videos": [os.path.relpath(output_target, task_dir)],
+        }
+
+        cases = [
+            ("top-level script",
+             ("script",), "altered script CANARY-ds1",
+             "render-local script manifest script disagrees with the "
+             "prepared script",
+             ("altered script CANARY-ds1", staged.script_text)),
+            ("params video_script",
+             ("params", "video_script"), "altered video script CANARY-ds2",
+             "render-local params video_script disagrees with the "
+             "prepared script",
+             ("altered video script CANARY-ds2", staged.script_text)),
+            ("video_source",
+             ("params", "video_source"), "pexels-CANARY-ds3",
+             "render-local params video_source must be local",
+             ("pexels-CANARY-ds3",)),
+            ("video_count",
+             ("params", "video_count"), 2,
+             "render-local params video_count must be 1",
+             ("2",)),
+            ("video_aspect",
+             ("params", "video_aspect"), "9:16-CANARY-ds5",
+             "render-local params video_aspect must be 16:9",
+             ("9:16-CANARY-ds5",)),
+            ("video_concat_mode",
+             ("params", "video_concat_mode"), "random-CANARY-ds6",
+             "render-local params video_concat_mode must be sequential",
+             ("random-CANARY-ds6",)),
+            ("video_clip_duration",
+             ("params", "video_clip_duration"), 6,
+             "render-local params video_clip_duration must be 5",
+             ("6",)),
+            ("voice_name",
+             ("params", "voice_name"), "en-US-AriaNeural-CANARY-ds8",
+             "render-local params voice_name must be no-voice",
+             ("en-US-AriaNeural-CANARY-ds8",)),
+            ("subtitle_enabled",
+             ("params", "subtitle_enabled"), True,
+             "render-local params subtitle_enabled must be false",
+             ("True",)),
+            ("bgm_type",
+             ("params", "bgm_type"), "upbeat-CANARY-ds10",
+             "render-local params bgm_type must be none",
+             ("upbeat-CANARY-ds10",)),
+        ]
+        for name, key_path, drift_value, expected_message, leaked in cases:
+            with self.subTest(case=name):
+                # Deep-copy the fixture and alter exactly one value.
+                altered = json.loads(json.dumps(script_json_fixture))
+                target = altered
+                for key in key_path[:-1]:
+                    target = target[key]
+                target[key_path[-1]] = drift_value
+                with open(script_json_target, "w", encoding="utf-8") as h:
+                    json.dump(altered, h)
+
+                before_tree = self.tree_snapshot(task_dir)
+                with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                    pilot_prepare._verify_render_local_render(
+                        draft, task_result
+                    )
+                message = str(ctx.exception)
+                self.assertEqual(message, expected_message)
+                for supplied in leaked:
+                    self.assertNotIn(supplied, message)
+                self.assertEqual(self.tree_snapshot(task_dir), before_tree)
+
+    # -- material drift refusals ----------------------------------------------
+
+    def test_render_material_drift_refused(self):
+        (
+            draft,
+            script_json_target,
+            script_json_fixture,
+            output_target,
+            _output_bytes,
+        ) = self.build_verifiable_fixtures()
+        staged = draft.staged
+        task_dir = staged.task_dir
+        # Task result, fixed parameters, script, and final-1.mp4 stay valid.
+        task_result = {
+            "task_id": staged.task_id,
+            "state": const.TASK_STATE_COMPLETE,
+            "progress": 100,
+            "videos": [os.path.relpath(output_target, task_dir)],
+        }
+        valid_materials = script_json_fixture["params"]["video_materials"]
+        match_msg = (
+            "render-local params video_materials must match the staged "
+            "materials"
+        )
+
+        cases = [
+            ("missing material",
+             valid_materials[:1],
+             match_msg,
+             (valid_materials[1]["url"],)),
+            ("extra material",
+             valid_materials + [
+                 {"provider": "local",
+                  "url": "materials/extra-CANARY-mx.mp4"}
+             ],
+             match_msg,
+             ("extra-CANARY-mx",)),
+            ("reversed order",
+             [valid_materials[1], valid_materials[0]],
+             "render-local material path disagrees with the staged copy",
+             tuple(entry["url"] for entry in valid_materials)),
+            ("non-local provider",
+             [{"provider": "pexels-CANARY-mp",
+               "url": valid_materials[0]["url"]},
+              valid_materials[1]],
+             "render-local material provider must be local",
+             ("pexels-CANARY-mp",)),
+            ("mismatched local path",
+             [{"provider": "local", "url": "materials/wrong-CANARY-mm.mp4"},
+              valid_materials[1]],
+             "render-local material path disagrees with the staged copy",
+             ("wrong-CANARY-mm",)),
+            ("remote URL",
+             [{"provider": "local",
+               "url": "https://example.com/CANARY-mr/clip.mp4"},
+              valid_materials[1]],
+             "render-local material path must be a local path",
+             ("https://example.com/CANARY-mr/clip.mp4",)),
+            ("non-mapping entry",
+             ["not-a-mapping-CANARY-me", valid_materials[1]],
+             match_msg,
+             ("not-a-mapping-CANARY-me",)),
+        ]
+        for name, materials_value, expected_message, leaked in cases:
+            with self.subTest(case=name):
+                # Deep-copy the fixture and alter only params.video_materials.
+                altered = json.loads(json.dumps(script_json_fixture))
+                altered["params"]["video_materials"] = json.loads(
+                    json.dumps(materials_value)
+                )
+                with open(script_json_target, "w", encoding="utf-8") as h:
+                    json.dump(altered, h)
+
+                before_tree = self.tree_snapshot(task_dir)
+                with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                    pilot_prepare._verify_render_local_render(
+                        draft, task_result
+                    )
+                message = str(ctx.exception)
+                self.assertEqual(message, expected_message)
+                for supplied in leaked:
+                    self.assertNotIn(supplied, message)
+                self.assertEqual(self.tree_snapshot(task_dir), before_tree)
+
+    # -- script.json file/shape refusals --------------------------------------
+
+    def test_script_json_file_or_shape_refused(self):
+        (
+            draft,
+            script_json_target,
+            script_json_fixture,
+            output_target,
+            _output_bytes,
+        ) = self.build_verifiable_fixtures()
+        staged = draft.staged
+        task_dir = staged.task_dir
+        # Task result and final-1.mp4 stay otherwise valid in every subtest.
+        task_result = {
+            "task_id": staged.task_id,
+            "state": const.TASK_STATE_COMPLETE,
+            "progress": 100,
+            "videos": [os.path.relpath(output_target, task_dir)],
+        }
+
+        def clear_script_json():
+            if os.path.islink(script_json_target) or os.path.isfile(
+                script_json_target
+            ):
+                os.unlink(script_json_target)
+            elif os.path.isdir(script_json_target):
+                os.rmdir(script_json_target)
+
+        def write_raw(data: bytes):
+            clear_script_json()
+            with open(script_json_target, "wb") as handle:
+                handle.write(data)
+
+        def write_altered(payload):
+            clear_script_json()
+            with open(script_json_target, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+
+        def fixture_copy():
+            return json.loads(json.dumps(script_json_fixture))
+
+        def fixture_drop_top(key):
+            altered = fixture_copy()
+            del altered[key]
+            return altered
+
+        def fixture_drop_param(key):
+            altered = fixture_copy()
+            del altered["params"][key]
+            return altered
+
+        def fixture_set(key_path, value):
+            altered = fixture_copy()
+            target = altered
+            for key in key_path[:-1]:
+                target = target[key]
+            target[key_path[-1]] = value
+            return altered
+
+        file_msg = (
+            "render-local script manifest must be an existing regular file"
+        )
+        shape_msg = "render-local script manifest has an unexpected shape"
+        match_msg = (
+            "render-local params video_materials must match the staged "
+            "materials"
+        )
+
+        cases = [
+            ("script.json missing",
+             clear_script_json,
+             file_msg,
+             (script_json_target,)),
+            ("script.json is a directory",
+             lambda: (clear_script_json(), os.mkdir(script_json_target)),
+             file_msg,
+             (script_json_target,)),
+            ("malformed JSON",
+             lambda: write_raw(b'{"script": CANARY-sj4 not json'),
+             "render-local script manifest is not valid JSON",
+             ("CANARY-sj4", "Expecting")),
+            ("top-level JSON is not an object",
+             lambda: write_altered(["CANARY-sj5"]),
+             "render-local script manifest must be a JSON object",
+             ("CANARY-sj5",)),
+            ("missing top-level script",
+             lambda: write_altered(fixture_drop_top("script")),
+             shape_msg,
+             (staged.script_text,)),
+            ("top-level script is not a string",
+             lambda: write_altered(fixture_set(("script",), 123)),
+             shape_msg,
+             ()),
+            ("missing params",
+             lambda: write_altered(fixture_drop_top("params")),
+             shape_msg,
+             ()),
+            ("params is not an object",
+             lambda: write_altered(fixture_set(("params",), "CANARY-sj9")),
+             shape_msg,
+             ("CANARY-sj9",)),
+            ("missing required fixed-profile field",
+             lambda: write_altered(fixture_drop_param("video_source")),
+             "render-local params video_source must be local",
+             ()),
+            ("video_materials is not a list",
+             lambda: write_altered(
+                 fixture_set(
+                     ("params", "video_materials"), "materials-CANARY-sj11"
+                 )
+             ),
+             match_msg,
+             ("materials-CANARY-sj11",)),
+        ]
+        for name, setup, expected_message, leaked in cases:
+            with self.subTest(case=name):
+                setup()
+                before_tree = self.tree_snapshot(task_dir)
+                with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                    pilot_prepare._verify_render_local_render(
+                        draft, task_result
+                    )
+                message = str(ctx.exception)
+                self.assertEqual(message, expected_message)
+                for supplied in leaked:
+                    self.assertNotIn(supplied, message)
+                # No new files; the deliberately altered fixture is untouched.
+                self.assertEqual(self.tree_snapshot(task_dir), before_tree)
+
+        # Symlinked script.json, where the platform permits creating one.
+        with self.subTest(case="script.json symlinked"):
+            clear_script_json()
+            real_target = os.path.join(
+                task_dir, "real-script-CANARY-sj3.json"
+            )
+            with open(real_target, "w", encoding="utf-8") as handle:
+                json.dump(script_json_fixture, handle)
+            try:
+                os.symlink(real_target, script_json_target)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink creation unavailable: {exc}")
+            before_tree = self.tree_snapshot(task_dir)
+            with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                pilot_prepare._verify_render_local_render(
+                    draft, task_result
+                )
+            message = str(ctx.exception)
+            self.assertEqual(
+                message,
+                "render-local script manifest contains a link or junction",
+            )
+            for supplied in (script_json_target, real_target, "CANARY-sj3"):
+                self.assertNotIn(supplied, message)
+            self.assertEqual(self.tree_snapshot(task_dir), before_tree)
+
+    # -- renderer output inventory refusals -----------------------------------
+
+    def test_render_output_inventory_refused(self):
+        (
+            draft,
+            _script_json_target,
+            _script_json_fixture,
+            output_target,
+            output_bytes,
+        ) = self.build_verifiable_fixtures()
+        staged = draft.staged
+        task_dir = staged.task_dir
+        # script.json and the task result stay otherwise valid.
+        task_result = {
+            "task_id": staged.task_id,
+            "state": const.TASK_STATE_COMPLETE,
+            "progress": 100,
+            "videos": [os.path.relpath(output_target, task_dir)],
+        }
+
+        output_names = (
+            "final-1.mp4",
+            "final-2.mp4",
+            "final-1__NEEDS_HUMAN_REVIEW.mp4",
+            "notes__NEEDS_HUMAN_REVIEW-CANARY-o7.txt",
+            "real-output-CANARY-o3.mp4",
+        )
+
+        def clear_output_fixtures():
+            for name in output_names:
+                full = os.path.join(task_dir, name)
+                if os.path.islink(full) or os.path.isfile(full):
+                    os.unlink(full)
+                elif os.path.isdir(full):
+                    os.rmdir(full)
+
+        def write_rel(name, data):
+            with open(os.path.join(task_dir, name), "wb") as handle:
+                handle.write(data)
+
+        marked_msg = (
+            "render-local marked output must not exist before verification"
+        )
+        cases = [
+            ("final-1.mp4 missing",
+             clear_output_fixtures,
+             "render-local output final-1.mp4 is missing",
+             (output_target,)),
+            ("final-1.mp4 is a directory",
+             lambda: (clear_output_fixtures(), os.mkdir(output_target)),
+             "render-local output final-1.mp4 must be an existing regular "
+             "file",
+             (output_target,)),
+            ("extra final-2.mp4",
+             lambda: (clear_output_fixtures(),
+                      write_rel("final-1.mp4", output_bytes),
+                      write_rel("final-2.mp4", b"extra-CANARY-o4")),
+             "render-local unexpected extra final video output",
+             ("final-2.mp4", "extra-CANARY-o4")),
+            ("only final-2.mp4 exists",
+             lambda: (clear_output_fixtures(),
+                      write_rel("final-2.mp4", b"extra-CANARY-o5")),
+             "render-local output final-1.mp4 is missing",
+             (output_target, "final-2.mp4", "CANARY-o5")),
+            ("pre-existing marked final output",
+             lambda: (clear_output_fixtures(),
+                      write_rel("final-1.mp4", output_bytes),
+                      write_rel("final-1__NEEDS_HUMAN_REVIEW.mp4",
+                                b"marked-CANARY-o6")),
+             marked_msg,
+             ("final-1__NEEDS_HUMAN_REVIEW.mp4",
+              prov.NEEDS_HUMAN_REVIEW_MARKER, "CANARY-o6")),
+            ("another marked filename",
+             lambda: (clear_output_fixtures(),
+                      write_rel("final-1.mp4", output_bytes),
+                      write_rel("notes__NEEDS_HUMAN_REVIEW-CANARY-o7.txt",
+                                b"marked")),
+             marked_msg,
+             ("notes__NEEDS_HUMAN_REVIEW-CANARY-o7.txt",
+              prov.NEEDS_HUMAN_REVIEW_MARKER, "CANARY-o7")),
+        ]
+        for name, setup, expected_message, leaked in cases:
+            with self.subTest(case=name):
+                setup()
+                before_tree = self.tree_snapshot(task_dir)
+                with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                    pilot_prepare._verify_render_local_render(
+                        draft, task_result
+                    )
+                message = str(ctx.exception)
+                self.assertEqual(message, expected_message)
+                for supplied in leaked:
+                    self.assertNotIn(supplied, message)
+                # Verification creates no marked file or other output; the
+                # deliberately altered tree stays byte-for-byte unchanged.
+                self.assertEqual(self.tree_snapshot(task_dir), before_tree)
+
+        # Symlinked final-1.mp4, where the platform permits creating one.
+        with self.subTest(case="final-1.mp4 symlinked"):
+            clear_output_fixtures()
+            real_output = os.path.join(
+                task_dir, "real-output-CANARY-o3.mp4"
+            )
+            with open(real_output, "wb") as handle:
+                handle.write(output_bytes)
+            try:
+                os.symlink(real_output, output_target)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink creation unavailable: {exc}")
+            before_tree = self.tree_snapshot(task_dir)
+            with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                pilot_prepare._verify_render_local_render(
+                    draft, task_result
+                )
+            message = str(ctx.exception)
+            self.assertEqual(
+                message, "render-local output contains a link or junction"
+            )
+            for supplied in (output_target, real_output, "CANARY-o3"):
+                self.assertNotIn(supplied, message)
+            self.assertEqual(self.tree_snapshot(task_dir), before_tree)
+
+        # Injected streamed-hash read failure.
+        with self.subTest(case="streamed-hash read failure"):
+            clear_output_fixtures()
+            write_rel("final-1.mp4", output_bytes)
+            before_tree = self.tree_snapshot(task_dir)
+            with patch(
+                "app.services.provenance.sha256_file_streamed",
+                side_effect=OSError("injected hash failure CANARY-o8"),
+            ):
+                with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                    pilot_prepare._verify_render_local_render(
+                        draft, task_result
+                    )
+            message = str(ctx.exception)
+            self.assertEqual(
+                message, "render-local output must be readable for hashing"
+            )
+            for supplied in (output_target, "injected", "CANARY-o8"):
+                self.assertNotIn(supplied, message)
+            self.assertEqual(self.tree_snapshot(task_dir), before_tree)
 
 
 if __name__ == "__main__":

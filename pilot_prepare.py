@@ -209,6 +209,18 @@ class RenderLocalPreparedDraft:
     manifest: dict
 
 
+@dataclass(frozen=True)
+class RenderLocalVerifiedRender:
+    """Verified post-render evidence for a prepared draft."""
+
+    draft: RenderLocalPreparedDraft
+    script_json_path: str
+    script_json: dict
+    output_path: str
+    output_sha256: str
+    task_result: dict
+
+
 def _require_pilot_policy():
     """Load the pilot policy, failing closed on any problem.
 
@@ -620,6 +632,201 @@ def _prepare_render_local_draft(
         if isinstance(exc, PrepareError):
             raise
         raise PrepareError("render-local draft preparation failed") from exc
+
+
+def _verify_render_local_render(
+    draft: RenderLocalPreparedDraft,
+    task_result: dict,
+) -> RenderLocalVerifiedRender:
+    """Verify post-render evidence for a prepared draft, strictly read-only.
+
+    The task result must satisfy the successful completion contract: a
+    non-empty mapping with state TASK_STATE_COMPLETE and progress 100,
+    so a failed task that happened to leave final-1.mp4 behind never
+    qualifies; task ID and output references, where present, must agree
+    with the prepared draft. script.json is resolved inside the
+    confined prepared task directory and must be a regular, non-linked
+    JSON object whose script and params match the prepared evidence
+    exactly. Exactly one unmarked final-1.mp4 is required and hashed
+    with the production streamed SHA-256 helper. Performs no writes,
+    copies, renames, manifest updates, or cleanup. Every PrepareError
+    message is static and never exposes script content, paths, JSON or
+    parser details, or native errors.
+    """
+    from app.models import const
+    from app.models.schema import VideoAspect, VideoConcatMode
+    from app.services import provenance as prov
+    from app.services import voice
+
+    staged = draft.staged
+    task_dir = staged.task_dir
+
+    # 1. task.start successful completion contract.
+    if not isinstance(task_result, dict) or not task_result:
+        raise PrepareError(
+            "render-local task result must be a non-empty mapping"
+        )
+    if task_result.get("state") != const.TASK_STATE_COMPLETE:
+        raise PrepareError("render-local task result state is not complete")
+    if task_result.get("progress") != 100:
+        raise PrepareError("render-local task result progress is not complete")
+    if "task_id" in task_result and task_result["task_id"] != staged.task_id:
+        raise PrepareError(
+            "render-local task result task ID disagrees with the prepared draft"
+        )
+
+    # 2. script.json — confined, regular, non-linked, JSON object.
+    lexical_manifest = os.path.abspath(os.path.join(task_dir, "script.json"))
+    script_json_path = os.path.realpath(lexical_manifest)
+    if os.path.normcase(lexical_manifest) != os.path.normcase(script_json_path):
+        raise PrepareError(
+            "render-local script manifest contains a link or junction"
+        )
+    if not os.path.isfile(script_json_path):
+        raise PrepareError(
+            "render-local script manifest must be an existing regular file"
+        )
+    try:
+        with open(script_json_path, "r", encoding="utf-8") as handle:
+            script_json = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PrepareError(
+            "render-local script manifest is not valid JSON"
+        ) from exc
+    if not isinstance(script_json, dict):
+        raise PrepareError("render-local script manifest must be a JSON object")
+    script_field = script_json.get("script")
+    params = script_json.get("params")
+    if not isinstance(script_field, str) or not isinstance(params, dict):
+        raise PrepareError("render-local script manifest has an unexpected shape")
+
+    # 3. Exact script and VideoParams evidence fields.
+    if script_field != staged.script_text:
+        raise PrepareError(
+            "render-local script manifest script disagrees with the prepared script"
+        )
+    if params.get("video_script") != staged.script_text:
+        raise PrepareError(
+            "render-local params video_script disagrees with the prepared script"
+        )
+    if params.get("video_source") != "local":
+        raise PrepareError("render-local params video_source must be local")
+    if params.get("video_count") != 1:
+        raise PrepareError("render-local params video_count must be 1")
+    if params.get("video_aspect") != VideoAspect.landscape.value:
+        raise PrepareError("render-local params video_aspect must be 16:9")
+    if params.get("video_concat_mode") != VideoConcatMode.sequential.value:
+        raise PrepareError(
+            "render-local params video_concat_mode must be sequential"
+        )
+    if params.get("video_clip_duration") != 5:
+        raise PrepareError("render-local params video_clip_duration must be 5")
+    if params.get("voice_name") != voice.NO_VOICE_NAME:
+        raise PrepareError("render-local params voice_name must be no-voice")
+    if params.get("subtitle_enabled") is not False:
+        raise PrepareError(
+            "render-local params subtitle_enabled must be false"
+        )
+    if params.get("bgm_type") != "none":
+        raise PrepareError("render-local params bgm_type must be none")
+
+    # 4. video_materials — ordered local copies of the staged evidence.
+    materials_param = params.get("video_materials")
+    if not isinstance(materials_param, list) or len(materials_param) != len(
+        staged.materials
+    ):
+        raise PrepareError(
+            "render-local params video_materials must match the staged materials"
+        )
+    for index, entry in enumerate(materials_param):
+        if not isinstance(entry, dict):
+            raise PrepareError(
+                "render-local params video_materials must match the staged "
+                "materials"
+            )
+        if entry.get("provider") != "local":
+            raise PrepareError("render-local material provider must be local")
+        url = entry.get("url")
+        if not isinstance(url, str) or not url.strip() or _is_remote_url(url):
+            raise PrepareError("render-local material path must be a local path")
+        candidate = url.strip()
+        if not os.path.isabs(candidate):
+            candidate = os.path.join(task_dir, candidate)
+        staged_path = staged.materials[index][0]
+        if os.path.normcase(os.path.realpath(candidate)) != os.path.normcase(
+            staged_path
+        ):
+            raise PrepareError(
+                "render-local material path disagrees with the staged copy"
+            )
+
+    # 5. Exactly one regular, non-linked, unmarked final-1.mp4 output.
+    try:
+        entries = os.listdir(task_dir)
+    except OSError as exc:
+        raise PrepareError(
+            "render-local task directory is not readable"
+        ) from exc
+    finals = [
+        name for name in entries if re.fullmatch(r"final-\d+\.mp4", name)
+    ]
+    if "final-1.mp4" not in finals:
+        raise PrepareError("render-local output final-1.mp4 is missing")
+    if len(finals) != 1:
+        raise PrepareError("render-local unexpected extra final video output")
+    if any(prov.NEEDS_HUMAN_REVIEW_MARKER in name for name in entries):
+        raise PrepareError(
+            "render-local marked output must not exist before verification"
+        )
+    lexical_output = os.path.abspath(os.path.join(task_dir, "final-1.mp4"))
+    output_path = os.path.realpath(lexical_output)
+    if os.path.normcase(lexical_output) != os.path.normcase(output_path):
+        raise PrepareError("render-local output contains a link or junction")
+    if not os.path.isfile(output_path):
+        raise PrepareError(
+            "render-local output final-1.mp4 must be an existing regular file"
+        )
+
+    # Output references in the task result, where present, must agree.
+    if "videos" in task_result:
+        videos = task_result["videos"]
+        if not isinstance(videos, (list, tuple)) or len(videos) != 1:
+            raise PrepareError(
+                "render-local task result outputs disagree with the prepared "
+                "draft"
+            )
+        video_ref = videos[0]
+        if not isinstance(video_ref, str) or _is_remote_url(video_ref):
+            raise PrepareError(
+                "render-local task result outputs disagree with the prepared "
+                "draft"
+            )
+        if not os.path.isabs(video_ref):
+            video_ref = os.path.join(task_dir, video_ref)
+        if os.path.normcase(os.path.realpath(video_ref)) != os.path.normcase(
+            output_path
+        ):
+            raise PrepareError(
+                "render-local task result outputs disagree with the prepared "
+                "draft"
+            )
+
+    # 6. Hash the verified renderer output with the production helper.
+    try:
+        output_sha256 = prov.sha256_file_streamed(output_path)
+    except (prov.ProvenanceError, OSError) as exc:
+        raise PrepareError(
+            "render-local output must be readable for hashing"
+        ) from exc
+
+    return RenderLocalVerifiedRender(
+        draft=draft,
+        script_json_path=script_json_path,
+        script_json=script_json,
+        output_path=output_path,
+        output_sha256=output_sha256,
+        task_result=dict(task_result),
+    )
 
 
 def _resolve_and_confine(task_dir: str, raw_path: str, *, must_exist: bool,
