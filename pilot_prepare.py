@@ -43,6 +43,7 @@ Guarantees:
 from __future__ import annotations
 
 import argparse
+import codecs
 import os
 import re
 import sys
@@ -170,6 +171,17 @@ class RenderLocalRequest:
     claims: tuple[tuple[str, str], ...]
 
 
+@dataclass(frozen=True)
+class RenderLocalLoadedInputs:
+    """Resolved local inputs and loaded script for a validated request."""
+
+    request: RenderLocalRequest
+    script_path: str
+    script_bytes: bytes
+    script_text: str
+    material_paths: tuple[str, ...]
+
+
 def _require_pilot_policy():
     """Load the pilot policy, failing closed on any problem.
 
@@ -281,6 +293,75 @@ def _validate_render_local_request(
         script_path=clean_script,
         materials=tuple(materials),
         claims=tuple(claim_pairs),
+    )
+
+
+def _load_render_local_inputs(
+    request: RenderLocalRequest,
+) -> RenderLocalLoadedInputs:
+    """Resolve local inputs and load the script for a validated request.
+
+    Performs no policy call; _validate_render_local_request owns policy-first
+    enforcement and must run before this helper. Filesystem reads only: no
+    writes, copies, hashing, UUID generation, directory creation, manifest
+    work, or renderer calls. Every PrepareError message is static and never
+    echoes supplied paths or content.
+    """
+    lexical_script = os.path.abspath(request.script_path.strip())
+    script_path = os.path.realpath(lexical_script)
+    if os.path.normcase(lexical_script) != os.path.normcase(script_path):
+        raise PrepareError(
+            "render-local script path contains a link or junction"
+        )
+    if not os.path.isfile(script_path):
+        raise PrepareError(
+            "render-local script path must be an existing regular file"
+        )
+
+    material_paths = []
+    seen_basenames = set()
+    for material in request.materials:
+        lexical = os.path.abspath(material.path.strip())
+        resolved = os.path.realpath(lexical)
+        if os.path.normcase(lexical) != os.path.normcase(resolved):
+            raise PrepareError(
+                "render-local material path contains a link or junction"
+            )
+        if not os.path.isfile(resolved):
+            raise PrepareError(
+                "render-local material path must be an existing regular file"
+            )
+        basename = os.path.normcase(os.path.basename(resolved))
+        if basename in seen_basenames:
+            raise PrepareError(
+                "render-local material basenames must be unique"
+            )
+        seen_basenames.add(basename)
+        material_paths.append(resolved)
+
+    with open(script_path, "rb") as handle:
+        script_bytes = handle.read()
+    try:
+        script_text = script_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PrepareError(
+            "render-local script must be valid UTF-8"
+        ) from exc
+    if script_bytes.startswith(codecs.BOM_UTF8):
+        raise PrepareError(
+            "render-local script must not start with a UTF-8 BOM"
+        )
+    if not script_text.strip():
+        raise PrepareError(
+            "render-local script must not be empty or whitespace-only"
+        )
+
+    return RenderLocalLoadedInputs(
+        request=request,
+        script_path=script_path,
+        script_bytes=script_bytes,
+        script_text=script_text,
+        material_paths=tuple(material_paths),
     )
 
 

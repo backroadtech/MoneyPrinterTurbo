@@ -695,5 +695,311 @@ class TestRenderLocalRequestValidation(_PrepareTestBase):
                     self.assertNotIn(canary, message)
 
 
+# ---------------------------------------------------------------------------
+# Render-local input loading (read-only filesystem checks + script load)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderLocalInputLoading(unittest.TestCase):
+    """Read-only _load_render_local_inputs tests on real temp files.
+
+    The helper performs no policy call, so these tests intentionally run
+    without any pilot policy fixture.
+    """
+
+    def setUp(self):
+        self._net = _NetworkBlocker()
+        self._net.__enter__()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+        self._net.__exit__(None, None, None)
+
+    # -- fixture helpers ----------------------------------------------------
+
+    def write_file(self, path: str, data: bytes) -> str:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def make_request(self, script_path, material_paths=(),
+                     claims=(("claim", "source"),)):
+        return pilot_prepare.RenderLocalRequest(
+            topic="render-local topic",
+            script_path=script_path,
+            materials=tuple(
+                pilot_prepare.RenderLocalMaterialRequest(
+                    path=path,
+                    license_name=f"license-{index}",
+                    license_evidence=f"evidence-{index}",
+                )
+                for index, path in enumerate(material_paths)
+            ),
+            claims=tuple(claims),
+        )
+
+    def tree_snapshot(self):
+        dirs = set()
+        files = {}
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            for dirname in dirnames:
+                dirs.add(os.path.relpath(os.path.join(dirpath, dirname),
+                                         self.root))
+            for filename in filenames:
+                full = os.path.join(dirpath, filename)
+                with open(full, "rb") as handle:
+                    files[os.path.relpath(full, self.root)] = handle.read()
+        return dirs, files
+
+    def _symlink(self, target, link):
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlink creation unavailable: {exc}")
+
+    # -- 1. happy path --------------------------------------------------------
+
+    def test_happy_path_preserves_bytes_text_paths_and_pairing(self):
+        script_bytes = (
+            b"Bitcoin basics line one.\r\n"
+            + "Línea dos con café y 中文.\r\n".encode("utf-8")
+            + b"last line without newline"
+        )
+        script_path = self.write_file(
+            os.path.join(self.root, "task", "script.txt"), script_bytes
+        )
+        material_b = self.write_file(
+            os.path.join(self.root, "task", "media", "clip-b.mp4"), b"bytes-b"
+        )
+        material_a = self.write_file(
+            os.path.join(self.root, "task", "media", "clip-a.mp4"), b"bytes-a"
+        )
+        request = self.make_request(script_path, [material_b, material_a])
+
+        result = pilot_prepare._load_render_local_inputs(request)
+
+        self.assertIs(result.request, request)
+        self.assertEqual(result.script_bytes, script_bytes)
+        self.assertEqual(result.script_text, script_bytes.decode("utf-8"))
+        self.assertEqual(
+            result.script_path,
+            os.path.realpath(os.path.abspath(script_path)),
+        )
+        self.assertIsInstance(result.material_paths, tuple)
+        self.assertEqual(
+            result.material_paths,
+            (
+                os.path.realpath(os.path.abspath(material_b)),
+                os.path.realpath(os.path.abspath(material_a)),
+            ),
+        )
+        # Material order stays aligned with the license pairing.
+        self.assertEqual(
+            [m.license_name for m in result.request.materials],
+            ["license-0", "license-1"],
+        )
+        self.assertEqual(result.request.claims, (("claim", "source"),))
+        # Result dataclass is immutable.
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            result.script_text = "mutated"
+        # Source files are untouched by the read-only load.
+        with open(script_path, "rb") as handle:
+            self.assertEqual(handle.read(), script_bytes)
+        with open(material_b, "rb") as handle:
+            self.assertEqual(handle.read(), b"bytes-b")
+        with open(material_a, "rb") as handle:
+            self.assertEqual(handle.read(), b"bytes-a")
+
+    # -- 2/3/4. refusal fixtures, canary checks, tree-unchanged -------------
+    # Each builder creates fixtures inside case_dir and returns the request
+    # plus every canary-bearing supplied value.
+
+    def _fixture_missing_script(self, case_dir):
+        material = self.write_file(
+            os.path.join(case_dir, "clip-CANARY-ms1.mp4"), b"m"
+        )
+        request = self.make_request(
+            os.path.join(case_dir, "missing-CANARY-ms2.txt"), [material]
+        )
+        return request, ["CANARY-ms1", "CANARY-ms2"]
+
+    def _fixture_script_is_directory(self, case_dir):
+        material = self.write_file(
+            os.path.join(case_dir, "clip-CANARY-sd1.mp4"), b"m"
+        )
+        os.makedirs(os.path.join(case_dir, "dir-CANARY-sd2.txt"))
+        request = self.make_request(
+            os.path.join(case_dir, "dir-CANARY-sd2.txt"), [material]
+        )
+        return request, ["CANARY-sd1", "CANARY-sd2"]
+
+    def _fixture_invalid_utf8(self, case_dir):
+        script = self.write_file(
+            os.path.join(case_dir, "script-CANARY-iu1.txt"),
+            b"invalid utf-8 \xff\xfe CANARY-content-iu2",
+        )
+        material = self.write_file(
+            os.path.join(case_dir, "clip-CANARY-iu3.mp4"), b"m"
+        )
+        return self.make_request(script, [material]), [
+            "CANARY-iu1", "CANARY-content-iu2", "CANARY-iu3",
+        ]
+
+    def _fixture_utf8_bom(self, case_dir):
+        script = self.write_file(
+            os.path.join(case_dir, "script-CANARY-bom1.txt"),
+            b"\xef\xbb\xbfCANARY-content-bom2",
+        )
+        material = self.write_file(
+            os.path.join(case_dir, "clip-CANARY-bom3.mp4"), b"m"
+        )
+        return self.make_request(script, [material]), [
+            "CANARY-bom1", "CANARY-content-bom2", "CANARY-bom3",
+        ]
+
+    def _fixture_empty_script(self, case_dir):
+        script = self.write_file(
+            os.path.join(case_dir, "script-CANARY-es1.txt"), b""
+        )
+        material = self.write_file(
+            os.path.join(case_dir, "clip-CANARY-es2.mp4"), b"m"
+        )
+        return self.make_request(script, [material]), [
+            "CANARY-es1", "CANARY-es2",
+        ]
+
+    def _fixture_whitespace_script(self, case_dir):
+        script = self.write_file(
+            os.path.join(case_dir, "script-CANARY-ws1.txt"), b" \t\r\n  "
+        )
+        material = self.write_file(
+            os.path.join(case_dir, "clip-CANARY-ws2.mp4"), b"m"
+        )
+        return self.make_request(script, [material]), [
+            "CANARY-ws1", "CANARY-ws2",
+        ]
+
+    def _fixture_symlinked_script(self, case_dir):
+        target = self.write_file(
+            os.path.join(case_dir, "real-CANARY-sl1.txt"), b"real script"
+        )
+        link = os.path.join(case_dir, "link-CANARY-sl2.txt")
+        self._symlink(target, link)
+        material = self.write_file(
+            os.path.join(case_dir, "clip-CANARY-sl3.mp4"), b"m"
+        )
+        return self.make_request(link, [material]), [
+            "CANARY-sl1", "CANARY-sl2", "CANARY-sl3",
+        ]
+
+    def _fixture_missing_material(self, case_dir):
+        script = self.write_file(
+            os.path.join(case_dir, "script-CANARY-mm1.txt"), b"ok"
+        )
+        request = self.make_request(
+            script, [os.path.join(case_dir, "missing-CANARY-mm2.mp4")]
+        )
+        return request, ["CANARY-mm1", "CANARY-mm2"]
+
+    def _fixture_material_is_directory(self, case_dir):
+        script = self.write_file(
+            os.path.join(case_dir, "script-CANARY-md1.txt"), b"ok"
+        )
+        os.makedirs(os.path.join(case_dir, "dir-CANARY-md2.mp4"))
+        request = self.make_request(
+            script, [os.path.join(case_dir, "dir-CANARY-md2.mp4")]
+        )
+        return request, ["CANARY-md1", "CANARY-md2"]
+
+    def _fixture_symlinked_material(self, case_dir):
+        script = self.write_file(
+            os.path.join(case_dir, "script-CANARY-sm1.txt"), b"ok"
+        )
+        target = self.write_file(
+            os.path.join(case_dir, "real-CANARY-sm2.mp4"), b"m"
+        )
+        link = os.path.join(case_dir, "link-CANARY-sm3.mp4")
+        self._symlink(target, link)
+        return self.make_request(script, [link]), [
+            "CANARY-sm1", "CANARY-sm2", "CANARY-sm3",
+        ]
+
+    def _fixture_duplicate_basename(self, case_dir):
+        script = self.write_file(
+            os.path.join(case_dir, "script-CANARY-db1.txt"), b"ok"
+        )
+        first = self.write_file(
+            os.path.join(case_dir, "one", "clip-CANARY-db2.mp4"), b"1"
+        )
+        second = self.write_file(
+            os.path.join(case_dir, "two", "clip-CANARY-db2.mp4"), b"2"
+        )
+        return self.make_request(script, [first, second]), [
+            "CANARY-db1", "CANARY-db2",
+        ]
+
+    def _fixture_case_basename_collision(self, case_dir):
+        if os.path.normcase("Aa") != os.path.normcase("aa"):
+            self.skipTest("platform uses case-sensitive path comparison")
+        script = self.write_file(
+            os.path.join(case_dir, "script-CANARY-cc1.txt"), b"ok"
+        )
+        first = self.write_file(
+            os.path.join(case_dir, "one", "clip-CANARY-cc2.mp4"), b"1"
+        )
+        second = self.write_file(
+            os.path.join(case_dir, "two", "CLIP-CANARY-cc2.mp4"), b"2"
+        )
+        return self.make_request(script, [first, second]), [
+            "CANARY-cc1", "CANARY-cc2",
+        ]
+
+    def test_refusals(self):
+        cases = [
+            ("missing script", self._fixture_missing_script,
+             "render-local script path must be an existing regular file"),
+            ("script is directory", self._fixture_script_is_directory,
+             "render-local script path must be an existing regular file"),
+            ("invalid utf-8", self._fixture_invalid_utf8,
+             "render-local script must be valid UTF-8"),
+            ("utf-8 BOM", self._fixture_utf8_bom,
+             "render-local script must not start with a UTF-8 BOM"),
+            ("empty script", self._fixture_empty_script,
+             "render-local script must not be empty or whitespace-only"),
+            ("whitespace script", self._fixture_whitespace_script,
+             "render-local script must not be empty or whitespace-only"),
+            ("symlinked script", self._fixture_symlinked_script,
+             "render-local script path contains a link or junction"),
+            ("missing material", self._fixture_missing_material,
+             "render-local material path must be an existing regular file"),
+            ("material is directory", self._fixture_material_is_directory,
+             "render-local material path must be an existing regular file"),
+            ("symlinked material", self._fixture_symlinked_material,
+             "render-local material path contains a link or junction"),
+            ("duplicate basename", self._fixture_duplicate_basename,
+             "render-local material basenames must be unique"),
+            ("case basename collision", self._fixture_case_basename_collision,
+             "render-local material basenames must be unique"),
+        ]
+        for name, builder, expected_message in cases:
+            with self.subTest(case=name):
+                case_dir = os.path.join(self.root, name.replace(" ", "_"))
+                os.makedirs(case_dir)
+                request, canaries = builder(case_dir)
+                before = self.tree_snapshot()
+                with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                    pilot_prepare._load_render_local_inputs(request)
+                message = str(ctx.exception)
+                self.assertEqual(message, expected_message)
+                # Static messages never echo supplied paths or content.
+                for canary in canaries:
+                    self.assertNotIn(canary, message)
+                # Refusals leave the whole temp tree untouched.
+                self.assertEqual(self.tree_snapshot(), before)
+
+
 if __name__ == "__main__":
     unittest.main()
