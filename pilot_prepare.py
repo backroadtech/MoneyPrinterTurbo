@@ -46,6 +46,7 @@ import argparse
 import os
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -154,6 +155,21 @@ def _build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class RenderLocalMaterialRequest:
+    path: str
+    license_name: str
+    license_evidence: str
+
+
+@dataclass(frozen=True)
+class RenderLocalRequest:
+    topic: str
+    script_path: str
+    materials: tuple[RenderLocalMaterialRequest, ...]
+    claims: tuple[tuple[str, str], ...]
+
+
 def _require_pilot_policy():
     """Load the pilot policy, failing closed on any problem.
 
@@ -171,6 +187,101 @@ def _require_pilot_policy():
             "pilot policy failure: MPT_PILOT_PROFILE is not 'braintrustcrypto'"
         )
     return policy
+
+
+def _validate_render_local_request(
+    *,
+    topic: str,
+    script_path: str,
+    material_paths: list[str] | tuple[str, ...],
+    license_names: list[str] | tuple[str, ...],
+    license_evidence: list[str] | tuple[str, ...],
+    claims: list[str] | tuple[str, ...] | None = None,
+    claim_sources: list[str] | tuple[str, ...] | None = None,
+) -> RenderLocalRequest:
+    """Pure in-memory validation of a render-local request.
+
+    The pilot policy gate runs first; everything after it is string-only
+    validation with no filesystem, hashing, UUID, or network access. Every
+    PrepareError message is static and never echoes supplied values or paths.
+    """
+    _require_pilot_policy()
+
+    clean_topic = topic.strip()
+    if not clean_topic:
+        raise PrepareError("render-local topic must be a non-empty string")
+
+    clean_script = script_path.strip()
+    if not clean_script:
+        raise PrepareError("render-local script path must be a non-empty string")
+    if _is_remote_url(clean_script):
+        raise PrepareError(
+            "render-local script path must be a local path, not a remote URL"
+        )
+
+    if not material_paths:
+        raise PrepareError("render-local requires at least one material")
+    if not (len(material_paths) == len(license_names) == len(license_evidence)):
+        raise PrepareError(
+            "render-local material path, license name, and license evidence "
+            "counts must match"
+        )
+
+    materials = []
+    for raw_path, raw_name, raw_evidence in zip(
+        material_paths, license_names, license_evidence
+    ):
+        clean_path = raw_path.strip()
+        clean_name = raw_name.strip()
+        clean_evidence = raw_evidence.strip()
+        if not clean_path:
+            raise PrepareError(
+                "render-local material path must be a non-empty string"
+            )
+        if not clean_name:
+            raise PrepareError(
+                "render-local material license name must be a non-empty string"
+            )
+        if not clean_evidence:
+            raise PrepareError(
+                "render-local material license evidence must be a non-empty string"
+            )
+        if _is_remote_url(clean_path):
+            raise PrepareError(
+                "render-local material path must be a local path, not a remote URL"
+            )
+        materials.append(
+            RenderLocalMaterialRequest(
+                path=clean_path,
+                license_name=clean_name,
+                license_evidence=clean_evidence,
+            )
+        )
+
+    raw_claims = claims or ()
+    raw_sources = claim_sources or ()
+    if len(raw_claims) != len(raw_sources):
+        raise PrepareError(
+            "render-local claim and claim source counts must match"
+        )
+    claim_pairs = []
+    for raw_claim, raw_source in zip(raw_claims, raw_sources):
+        clean_claim = raw_claim.strip()
+        clean_source = raw_source.strip()
+        if not clean_claim:
+            raise PrepareError("render-local claim must be a non-empty string")
+        if not clean_source:
+            raise PrepareError(
+                "render-local claim source must be a non-empty string"
+            )
+        claim_pairs.append((clean_claim, clean_source))
+
+    return RenderLocalRequest(
+        topic=clean_topic,
+        script_path=clean_script,
+        materials=tuple(materials),
+        claims=tuple(claim_pairs),
+    )
 
 
 def _resolve_and_confine(task_dir: str, raw_path: str, *, must_exist: bool,

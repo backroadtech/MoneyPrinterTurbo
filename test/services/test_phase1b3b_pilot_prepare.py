@@ -17,6 +17,7 @@ Covers:
   path is invoked
 """
 
+import dataclasses
 import json
 import os
 import socket
@@ -536,6 +537,162 @@ class TestNoForbiddenPathsInvoked(_PrepareTestBase):
             {n for n in newly if n == "requests" or n.startswith("requests.")},
             set(),
         )
+
+
+# ---------------------------------------------------------------------------
+# Render-local request validation (pure, in-memory)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderLocalRequestValidation(_PrepareTestBase):
+    """Focused tests for the pure _validate_render_local_request validator."""
+
+    @staticmethod
+    def _valid_kwargs() -> dict:
+        """Canary-laden inputs that pass validation."""
+        return {
+            "topic": "topic canary 1a2b3c",
+            "script_path": "canary-script-dir-4d5e6f/script.txt",
+            "material_paths": ["canary-material-7g8h9i/clip.mp4"],
+            "license_names": ["license canary 0j1k2l"],
+            "license_evidence": ["evidence canary 3m4n5o"],
+            "claims": ["claim canary 6p7q8r"],
+            "claim_sources": ["source canary 9s0t1u"],
+        }
+
+    @staticmethod
+    def _canary_values(kwargs) -> list:
+        """Every supplied value carrying a unique canary marker."""
+        found = []
+        for value in kwargs.values():
+            candidates = [value] if isinstance(value, str) else list(value)
+            found.extend(c for c in candidates if "canary" in c.lower())
+        return found
+
+    # -- 1. policy gate runs first -----------------------------------------
+
+    def test_policy_gate_runs_before_any_input_processing(self):
+        sentinel = pilot_prepare.PrepareError("policy gate sentinel")
+        with patch.object(
+            pilot_prepare, "_require_pilot_policy", side_effect=sentinel
+        ) as gate, patch.object(
+            pilot_prepare,
+            "_is_remote_url",
+            side_effect=AssertionError("_is_remote_url must not run"),
+        ) as remote_check:
+            with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                pilot_prepare._validate_render_local_request(
+                    topic="   ",
+                    script_path="https://canary.invalid/script.txt",
+                    material_paths=[],
+                    license_names=[],
+                    license_evidence=[],
+                )
+        self.assertIs(ctx.exception, sentinel)
+        gate.assert_called_once_with()
+        remote_check.assert_not_called()
+
+    # -- 2. valid request ---------------------------------------------------
+
+    def test_valid_request_returns_frozen_ordered_dataclasses(self):
+        request = pilot_prepare._validate_render_local_request(
+            topic="  bitcoin basics  ",
+            script_path="  task-001/script.txt ",
+            material_paths=[" task-001/clip-b.mp4 ", "task-001/clip-a.mp4"],
+            license_names=[" CC0 ", "ODbL"],
+            license_evidence=[" ref-b ", "ref-a"],
+            claims=[" claim one ", "claim two"],
+            claim_sources=[" src-1 ", "src-2"],
+        )
+        self.assertIsInstance(request, pilot_prepare.RenderLocalRequest)
+        self.assertEqual(request.topic, "bitcoin basics")
+        self.assertEqual(request.script_path, "task-001/script.txt")
+        self.assertIsInstance(request.materials, tuple)
+        self.assertIsInstance(request.claims, tuple)
+        for material in request.materials:
+            self.assertIsInstance(
+                material, pilot_prepare.RenderLocalMaterialRequest
+            )
+        # Positional pairing and input order are preserved after stripping.
+        self.assertEqual(
+            [
+                (m.path, m.license_name, m.license_evidence)
+                for m in request.materials
+            ],
+            [
+                ("task-001/clip-b.mp4", "CC0", "ref-b"),
+                ("task-001/clip-a.mp4", "ODbL", "ref-a"),
+            ],
+        )
+        self.assertEqual(
+            request.claims,
+            (("claim one", "src-1"), ("claim two", "src-2")),
+        )
+        # Both dataclasses are immutable.
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            request.topic = "mutated"
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            request.materials[0].path = "mutated"
+
+    # -- 3/4. table-driven PrepareError cases, canary leak checks -----------
+
+    def test_prepare_error_cases(self):
+        cases = [
+            ("empty topic",
+             {"topic": "   "},
+             "render-local topic must be a non-empty string"),
+            ("empty script path",
+             {"script_path": "  "},
+             "render-local script path must be a non-empty string"),
+            ("zero materials",
+             {"material_paths": []},
+             "render-local requires at least one material"),
+            ("empty material path",
+             {"material_paths": ["  "]},
+             "render-local material path must be a non-empty string"),
+            ("empty license name",
+             {"license_names": [" "]},
+             "render-local material license name must be a non-empty string"),
+            ("empty license evidence",
+             {"license_evidence": ["\t"]},
+             "render-local material license evidence must be a "
+             "non-empty string"),
+            ("mismatched material/license counts",
+             {"material_paths": ["canary-material-7g8h9i/clip.mp4",
+                                 "canary-material-2b3c4d/clip2.mp4"]},
+             "render-local material path, license name, and license evidence "
+             "counts must match"),
+            ("mismatched claim/source counts",
+             {"claims": ["claim canary 6p7q8r", "claim canary 5e6f7g"]},
+             "render-local claim and claim source counts must match"),
+            ("empty claim",
+             {"claims": ["   "],
+              "claim_sources": ["source canary 9s0t1u"]},
+             "render-local claim must be a non-empty string"),
+            ("empty claim source",
+             {"claim_sources": ["  "]},
+             "render-local claim source must be a non-empty string"),
+            ("remote script URL",
+             {"script_path":
+              "https://canary-host-8h9i0j.example.com/script.txt"},
+             "render-local script path must be a local path, not a remote URL"),
+            ("remote material URL",
+             {"material_paths":
+              ["ftp://canary-host-1k2l3m.example.com/clip.mp4"]},
+             "render-local material path must be a local path, not a "
+             "remote URL"),
+        ]
+        for name, override, expected_message in cases:
+            with self.subTest(case=name):
+                kwargs = self._valid_kwargs()
+                kwargs.update(override)
+                with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                    pilot_prepare._validate_render_local_request(**kwargs)
+                message = str(ctx.exception)
+                self.assertEqual(message, expected_message)
+                # Static messages never echo supplied canary values or paths.
+                for canary in self._canary_values(kwargs):
+                    self.assertNotIn(canary, message)
 
 
 if __name__ == "__main__":
