@@ -71,6 +71,7 @@ JOURNAL_KWARGS = dict(
     created_at_utc=UTC,
     original_reviewer_id=REVIEWER_ID,
     original_reviewer_display_name=REVIEWER_NAME,
+    claim_notes="fixture claim notes",
 )
 
 
@@ -827,6 +828,94 @@ class TestTransactionJournal(_TaskDirBase):
             f for f in os.listdir(self.task_dir) if "tmp" in f or "part" in f
         ]
         self.assertEqual(leftovers, [])
+
+    def test_claim_notes_required_on_read(self):
+        self._create_journal()
+        self._rewrite_journal_file(lambda d: d.__delitem__("claim_notes"))
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.read_transaction_journal(self.task_dir)
+
+    def test_claim_notes_type_validation(self):
+        for bad in (123, 4.5, True, ["notes"], {"notes": 1}, b"bytes"):
+            with self.subTest(value_type=type(bad).__name__):
+                with self.assertRaises(ri.ReviewIntegrityError):
+                    self._create_journal(claim_notes=bad)
+                self.assertIsNone(ri.read_transaction_journal(self.task_dir))
+        # A hash-consistent file with a non-string value also fails closed.
+        self._create_journal()
+        self._rewrite_journal_file(lambda d: d.__setitem__("claim_notes", 42))
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.read_transaction_journal(self.task_dir)
+
+    def test_claim_notes_round_trip_null_and_string(self):
+        journal = self._create_journal(claim_notes=None)
+        self.assertIsNone(journal["claim_notes"])
+        read_back = ri.read_transaction_journal(self.task_dir)
+        self.assertIsNone(read_back["claim_notes"])
+        path = os.path.join(self.task_dir, "review-transaction.json")
+        with open(path, encoding="utf-8") as handle:
+            on_disk = json.load(handle)
+        self.assertIsNone(on_disk["claim_notes"])
+        self.assertEqual(on_disk, read_back)
+
+        ri.delete_transaction_journal(self.task_dir)
+        journal = self._create_journal(claim_notes="exact round-trip notes")
+        self.assertEqual(journal["claim_notes"], "exact round-trip notes")
+        read_back = ri.read_transaction_journal(self.task_dir)
+        self.assertEqual(read_back["claim_notes"], "exact round-trip notes")
+        with open(path, encoding="utf-8") as handle:
+            on_disk = json.load(handle)
+        self.assertEqual(on_disk["claim_notes"], "exact round-trip notes")
+        self.assertEqual(on_disk, read_back)
+
+    def test_claim_notes_covered_by_journal_hash(self):
+        first = self._create_journal(claim_notes="hash coverage alpha")
+        self.assertEqual(
+            first["journal_hash"],
+            ri._canonical_hash(ri._journal_unsigned_fields(first)),
+        )
+        ri.delete_transaction_journal(self.task_dir)
+        second = self._create_journal(claim_notes="hash coverage beta")
+        self.assertEqual(
+            second["journal_hash"],
+            ri._canonical_hash(ri._journal_unsigned_fields(second)),
+        )
+        self.assertNotEqual(first["journal_hash"], second["journal_hash"])
+
+    def test_claim_notes_immutable_across_stage_updates(self):
+        journal = self._create_journal(claim_notes="immutable stage notes")
+        stages = [
+            "LOCK_ACQUIRED",
+            "SNAPSHOT_CREATED",
+            "PROPOSED_MANIFEST_READY",
+            "EVENT_CREATED",
+            "CHECKPOINT_UPDATED",
+            "MANIFEST_INSTALLED",
+            "COMMITTED",
+        ]
+        for stage in stages:
+            with self.subTest(stage=stage):
+                updated = ri.update_transaction_stage(
+                    self.task_dir,
+                    transaction_id=journal["transaction_id"],
+                    new_stage=stage,
+                )
+                self.assertEqual(updated["claim_notes"], "immutable stage notes")
+                read_back = ri.read_transaction_journal(self.task_dir)
+                self.assertEqual(
+                    read_back["claim_notes"], "immutable stage notes"
+                )
+
+    def test_read_modified_claim_notes_fails_closed(self):
+        self._create_journal(claim_notes="original notes")
+        path = os.path.join(self.task_dir, "review-transaction.json")
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        data["claim_notes"] = "tampered notes"
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        with self.assertRaises(ri.ReviewIntegrityError):
+            ri.read_transaction_journal(self.task_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -1680,6 +1769,7 @@ class TestReadOnlyCliDetection(unittest.TestCase):
         self.assertEqual(code, 1)
         for leaked in (
             JOURNAL_KWARGS["claim_id"],
+            JOURNAL_KWARGS["claim_notes"],
             JOURNAL_KWARGS["lock_token"],
             JOURNAL_KWARGS["expected_event_id"],
             JOURNAL_KWARGS["expected_event_hash"],

@@ -26,15 +26,15 @@ def headless_task_app(tmp_path, monkeypatch):
 
     monkeypatch.setattr(utils, "task_dir", lambda: str(tasks_dir))
     monkeypatch.setattr(sm.state, "get_all_tasks", lambda *_args, **_kwargs: ([], 0))
-    monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.delenv("DISPLAY", raising=False)
-    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
 
     # AppTest 会多次重新执行页面脚本；配置保存必须在整个测试生命周期内保持
     # 隔离，防止控件初始化意外写入开发者的 config.toml。
     with patch.object(config, "try_save_config", return_value=True):
         app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=60)
         app.run()
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
         yield app, video_file
 
 
@@ -67,5 +67,6 @@ def test_headless_open_folder_shows_host_mapped_path(headless_task_app):
 
     assert not app.exception
     assert any(
-        "./storage/tasks/headless-test" in toast.value for toast in app.get("toast")
+        "./storage/tasks/headless-test" in toast.value.replace("\\", "/")
+        for toast in app.get("toast")
     )

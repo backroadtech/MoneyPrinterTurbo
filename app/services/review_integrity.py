@@ -236,6 +236,7 @@ _JOURNAL_REQUIRED_FIELDS = (
     "created_at_utc",
     "original_reviewer_id",
     "original_reviewer_display_name",
+    "claim_notes",
     "journal_hash",
 )
 
@@ -249,6 +250,7 @@ _JOURNAL_IMMUTABLE_FIELDS = frozenset(
         "operation",
         "task_id",
         "claim_id",
+        "claim_notes",
         "starting_manifest_hash",
         "proposed_manifest_hash",
         "proposed_manifest_relative_path",
@@ -353,6 +355,11 @@ def _validate_journal_structure(journal: dict, base: str) -> None:
                 f"transaction journal {field} must be a 32-char hex string"
             )
     prov.validate_claim_id(journal["claim_id"], "journal.claim_id")
+    claim_notes = journal["claim_notes"]
+    if claim_notes is not None and not isinstance(claim_notes, str):
+        raise ReviewIntegrityError(
+            "transaction journal claim_notes must be a string or null"
+        )
     _validate_journal_relative_path(
         base, journal["proposed_manifest_relative_path"],
         "proposed_manifest_relative_path",
@@ -374,6 +381,7 @@ def create_transaction_journal(
     operation: str,
     task_id: str,
     claim_id: str,
+    claim_notes: str | None,
     starting_manifest_hash: str,
     proposed_manifest_hash: str,
     proposed_manifest_relative_path: str,
@@ -416,6 +424,10 @@ def create_transaction_journal(
             "expected_event_id must be a 32-char hex string"
         )
     prov.validate_claim_id(claim_id, "journal.claim_id")
+    if claim_notes is not None and not isinstance(claim_notes, str):
+        raise ReviewIntegrityError(
+            "claim_notes must be a string or null"
+        )
 
     path = _journal_path(task_dir)
     base = os.path.dirname(path)
@@ -448,6 +460,7 @@ def create_transaction_journal(
         "created_at_utc": created_at_utc,
         "original_reviewer_id": original_reviewer_id,
         "original_reviewer_display_name": original_reviewer_display_name,
+        "claim_notes": claim_notes,
     }
     journal["journal_hash"] = _canonical_hash(_journal_unsigned_fields(journal))
 
@@ -595,6 +608,11 @@ def _resolve_task_dir(task_dir: str) -> str:
     if not isinstance(task_dir, str) or not task_dir:
         raise ReviewIntegrityError("task_dir must be a non-empty string")
     base = os.path.realpath(task_dir)
+    lexical = os.path.normcase(os.path.abspath(task_dir))
+    if lexical != os.path.normcase(base):
+        raise ReviewIntegrityError(
+            "task directory path traverses a link or junction"
+        )
     if not os.path.isdir(base):
         raise ReviewIntegrityError(f"task directory does not exist: {task_dir!r}")
     return base
