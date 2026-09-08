@@ -645,6 +645,49 @@ def _prepare_render_local_draft(
         raise PrepareError("render-local draft preparation failed") from exc
 
 
+def _build_render_local_video_params(
+    draft: RenderLocalPreparedDraft,
+) -> "VideoParams":
+    """Fixed render parameters for a prepared render-local draft.
+
+    Purely in-memory: binds the validated topic, the exact staged script
+    text, and the task-local staged material paths (original order,
+    provider local) into the established VideoParams shape with the fixed
+    render-local constants; unrelated fields keep their existing
+    defaults. No policy call, filesystem access, mutation, parser
+    wiring, task.start, or rendering.
+    """
+    from app.models.schema import (
+        MaterialInfo,
+        VideoAspect,
+        VideoConcatMode,
+        VideoParams,
+    )
+    from app.services import voice
+
+    staged = draft.staged
+    task_dir = staged.task_dir
+    return VideoParams(
+        video_subject=staged.loaded.request.topic,
+        video_script=staged.script_text,
+        video_source="local",
+        video_materials=[
+            MaterialInfo(
+                provider="local",
+                url=os.path.relpath(staged_path, task_dir),
+            )
+            for staged_path, _staged_hash in staged.materials
+        ],
+        video_count=1,
+        video_aspect=VideoAspect.landscape.value,
+        video_concat_mode=VideoConcatMode.sequential.value,
+        video_clip_duration=5,
+        voice_name=voice.NO_VOICE_NAME,
+        subtitle_enabled=False,
+        bgm_type="none",
+    )
+
+
 def _verify_render_local_render(
     draft: RenderLocalPreparedDraft,
     task_result: dict,

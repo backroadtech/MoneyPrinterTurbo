@@ -3249,5 +3249,130 @@ class TestRenderLocalMarkedOutputFinalization(_PrepareTestBase):
         self.assertEqual(after_files, before_files)
 
 
+# ---------------------------------------------------------------------------
+# Render-local fixed render-parameter builder (in-memory)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildRenderLocalVideoParams(_PrepareTestBase):
+    """In-memory unit test for _build_render_local_video_params."""
+
+    def test_build_render_local_video_params_fixed_values(self):
+        task_dir = os.path.join("storage", "tasks", "task-fixed")
+        script_text = "fixed params script CANARY-p1.\n"
+        script_bytes = script_text.encode("utf-8")
+        request = pilot_prepare.RenderLocalRequest(
+            topic="fixed params topic CANARY-p2",
+            script_path="src/script.txt",
+            materials=(
+                pilot_prepare.RenderLocalMaterialRequest(
+                    path="src/clip-b.mp4",
+                    license_name="CC0",
+                    license_evidence="ref-b",
+                ),
+                pilot_prepare.RenderLocalMaterialRequest(
+                    path="src/clip-a.mp4",
+                    license_name="ODbL",
+                    license_evidence="ref-a",
+                ),
+            ),
+            claims=(("claim one", "https://example.org/source"),),
+        )
+        loaded = pilot_prepare.RenderLocalLoadedInputs(
+            request=request,
+            script_path=request.script_path,
+            script_bytes=script_bytes,
+            script_text=script_text,
+            material_paths=tuple(m.path for m in request.materials),
+        )
+        staged_paths = (
+            os.path.join(task_dir, "materials", "clip-b.mp4"),
+            os.path.join(task_dir, "materials", "clip-a.mp4"),
+        )
+        staged = pilot_prepare.RenderLocalStagedTask(
+            loaded=loaded,
+            task_id="task-fixed",
+            task_dir=task_dir,
+            script_path=os.path.join(task_dir, "script.md"),
+            script_sha256=hashlib.sha256(script_bytes).hexdigest(),
+            script_text=script_text,
+            materials=(
+                (staged_paths[0], "hash-b"),
+                (staged_paths[1], "hash-a"),
+            ),
+            created_paths=(),
+        )
+        draft = pilot_prepare.RenderLocalPreparedDraft(
+            staged=staged,
+            manifest_path=os.path.join(
+                task_dir, "provenance_manifest.json"
+            ),
+            manifest={},
+        )
+
+        forbidden_prefixes = ("app.services.task",)
+        before = {
+            name
+            for name in sys.modules
+            if name.startswith(forbidden_prefixes)
+        }
+        with patch.object(
+            pilot_prepare, "_require_pilot_policy"
+        ) as policy_mock:
+            with patch(
+                "builtins.open",
+                side_effect=AssertionError("filesystem access"),
+            ):
+                params = pilot_prepare._build_render_local_video_params(
+                    draft
+                )
+        after = {
+            name
+            for name in sys.modules
+            if name.startswith(forbidden_prefixes)
+        }
+
+        # No policy call, no task import, no filesystem access.
+        policy_mock.assert_not_called()
+        self.assertEqual(after - before, set())
+
+        # Fixed render-local values.
+        self.assertEqual(
+            params.video_subject, "fixed params topic CANARY-p2"
+        )
+        self.assertEqual(params.video_script, script_text)
+        self.assertEqual(params.video_script.encode("utf-8"), script_bytes)
+        self.assertEqual(params.video_source, "local")
+        self.assertEqual(
+            [m.provider for m in params.video_materials],
+            ["local", "local"],
+        )
+        self.assertEqual(
+            [m.url for m in params.video_materials],
+            [
+                os.path.relpath(staged_paths[0], task_dir),
+                os.path.relpath(staged_paths[1], task_dir),
+            ],
+        )
+        self.assertEqual(params.video_count, 1)
+        self.assertEqual(params.video_aspect, VideoAspect.landscape.value)
+        self.assertEqual(
+            params.video_concat_mode, VideoConcatMode.sequential.value
+        )
+        self.assertEqual(params.video_clip_duration, 5)
+        self.assertEqual(params.voice_name, voice.NO_VOICE_NAME)
+        self.assertFalse(params.subtitle_enabled)
+        self.assertEqual(params.bgm_type, "none")
+
+        # Input dataclasses are unchanged (identical frozen objects).
+        self.assertIs(draft.staged, staged)
+        self.assertIs(staged.loaded, loaded)
+        self.assertIs(loaded.request, request)
+        self.assertEqual(staged.script_text, script_text)
+        self.assertEqual(
+            tuple(path for path, _ in staged.materials), staged_paths
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
