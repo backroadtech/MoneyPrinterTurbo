@@ -221,6 +221,17 @@ class RenderLocalVerifiedRender:
     task_result: dict
 
 
+@dataclass(frozen=True)
+class RenderLocalFinalizedRender:
+    """Finalized marked-output evidence for a verified local render."""
+
+    verified: RenderLocalVerifiedRender
+    marked_output_path: str
+    marked_output_sha256: str
+    manifest_path: str
+    manifest: dict
+
+
 def _require_pilot_policy():
     """Load the pilot policy, failing closed on any problem.
 
@@ -826,6 +837,228 @@ def _verify_render_local_render(
         output_path=output_path,
         output_sha256=output_sha256,
         task_result=dict(task_result),
+    )
+
+
+def _restore_draft_manifest(manifest_path, original_bytes, marked_path,
+                            cause):
+    """Best-effort restore of the exact original manifest bytes.
+
+    Atomically rewrites the original draft manifest, removes the marked
+    copy, and rereads the manifest to verify restoration where possible.
+    Always raises a static PrepareError chaining the given cause.
+    """
+    try:
+        _atomic_write_stream(manifest_path, (original_bytes,))
+    except OSError:
+        pass
+    try:
+        os.unlink(marked_path)
+    except OSError:
+        pass
+    try:
+        with open(manifest_path, "rb") as handle:
+            restored_ok = handle.read() == original_bytes
+    except OSError:
+        restored_ok = False
+    if restored_ok:
+        raise PrepareError("render-local finalization failed") from cause
+    raise PrepareError(
+        "render-local finalization failed and the draft manifest could "
+        "not be restored"
+    ) from cause
+
+
+def _finalize_render_local_marked_output(
+    verified: RenderLocalVerifiedRender,
+) -> RenderLocalFinalizedRender:
+    """Finalize a verified render into marked-output form, atomically.
+
+    Before mutating anything, durably rereads provenance_manifest.json,
+    revalidates it through production validation, requires it to equal
+    the prepared draft evidence with output still None, reverifies the
+    current script and task-local material hashes against it, and
+    requires the marked target derived through
+    provenance.marked_filename("final-1.mp4") to be absent.
+
+    Finalization stream-copies final-1.mp4 to the marked target via
+    same-directory temp + fsync + os.replace, requires the original and
+    marked copy hashes to equal the verified output hash, builds the
+    output section through the production provenance builder, rebuilds
+    the complete manifest through production builders with every
+    prepared section (schema/task identity, NEEDS_HUMAN_REVIEW, script,
+    ordered assets/licenses, claims, created timestamps) preserved
+    verbatim, validates it, and atomically replaces
+    provenance_manifest.json last, then durably rereads and revalidates
+    the final manifest before returning.
+
+    The exact original manifest bytes are captured before mutation. Any
+    failure before replacement removes only the marked temp/copy; the
+    original draft manifest and renderer evidence stay unchanged. If
+    replacement succeeds but durable final verification fails, the
+    original manifest bytes are atomically restored and the marked copy
+    removed, with restoration verified where possible. final-1.mp4,
+    script.json, script.md, materials, and external inputs are never
+    altered or deleted; deletion is unlink-only, never recursive. All
+    PrepareError surfaces are static, with native details chained only
+    as internal causes. A crash may leave either the valid draft or a
+    fully valid finalized manifest, never a half-written one.
+    """
+    from app.services import provenance as prov
+
+    draft = verified.draft
+    staged = draft.staged
+    task_dir = staged.task_dir
+    manifest_path = draft.manifest_path
+
+    # 1. Durably reread the prepared manifest; capture exact bytes.
+    try:
+        with open(manifest_path, "rb") as handle:
+            original_bytes = handle.read()
+    except OSError as exc:
+        raise PrepareError(
+            "render-local durable manifest is unreadable"
+        ) from exc
+    try:
+        durable = json.loads(original_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PrepareError(
+            "render-local durable manifest is not valid JSON"
+        ) from exc
+
+    # 2. Production validation of the durable manifest.
+    try:
+        prov.validate_manifest(durable)
+    except prov.ProvenanceError as exc:
+        raise PrepareError(
+            "render-local durable manifest failed validation"
+        ) from exc
+
+    # 3. Must equal the prepared draft evidence, still output-null.
+    if durable != draft.manifest:
+        raise PrepareError(
+            "render-local durable manifest disagrees with the prepared "
+            "draft"
+        )
+    if durable.get("output") is not None:
+        raise PrepareError(
+            "render-local durable manifest already records an output"
+        )
+
+    # 4. Reverify current script and task-local material hashes.
+    try:
+        current_script_hash = prov.sha256_file_streamed(staged.script_path)
+    except (prov.ProvenanceError, OSError) as exc:
+        raise PrepareError(
+            "render-local staged script must be readable for hashing"
+        ) from exc
+    if current_script_hash != durable["script"]["sha256"]:
+        raise PrepareError(
+            "render-local staged script hash changed since preparation"
+        )
+    for index, (staged_path, _staged_hash) in enumerate(staged.materials):
+        try:
+            current_hash = prov.sha256_file_streamed(staged_path)
+        except (prov.ProvenanceError, OSError) as exc:
+            raise PrepareError(
+                "render-local staged material must be readable for "
+                "hashing"
+            ) from exc
+        if current_hash != durable["assets"][index]["sha256"]:
+            raise PrepareError(
+                "render-local staged material hash changed since "
+                "preparation"
+            )
+
+    # 5. The marked target must not already exist.
+    marked_name = prov.marked_filename("final-1.mp4")
+    marked_path = os.path.join(task_dir, marked_name)
+    if os.path.lexists(marked_path):
+        raise PrepareError("render-local marked output already exists")
+
+    # 6-9. Copy, hash-check, and rebuild before the atomic replacement.
+    marked_created = False
+    try:
+        with open(verified.output_path, "rb") as handle:
+            _atomic_write_stream(
+                marked_path,
+                iter(lambda: handle.read(_STAGING_COPY_CHUNK_SIZE), b""),
+            )
+        marked_created = True
+
+        original_hash = prov.sha256_file_streamed(verified.output_path)
+        if original_hash != verified.output_sha256:
+            raise PrepareError(
+                "render-local verified output hash changed since "
+                "verification"
+            )
+        marked_hash = prov.sha256_file_streamed(marked_path)
+        if marked_hash != verified.output_sha256:
+            raise PrepareError(
+                "render-local marked output hash mismatch"
+            )
+
+        output_section = prov.build_output_section(
+            task_dir,
+            local_path=marked_name,
+            compute_hash=True,
+        )
+        if output_section["sha256"] != verified.output_sha256:
+            raise PrepareError(
+                "render-local marked output hash mismatch"
+            )
+
+        rebuilt = prov.build_manifest(
+            task=durable["task"],
+            script=durable["script"],
+            assets=durable["assets"],
+            factual_claims=durable["factual_claims"],
+            ai_generations=durable["ai_generations"],
+            output=output_section,
+        )
+        prov.validate_manifest(rebuilt)
+    except Exception as exc:
+        if marked_created:
+            try:
+                os.unlink(marked_path)
+            except OSError:
+                pass
+        if isinstance(exc, PrepareError):
+            raise
+        raise PrepareError("render-local finalization failed") from exc
+
+    # 10. Atomically replace provenance_manifest.json last.
+    try:
+        final_path = prov.write_manifest_atomic(task_dir, rebuilt)
+    except Exception as exc:
+        try:
+            os.unlink(marked_path)
+        except OSError:
+            pass
+        raise PrepareError("render-local finalization failed") from exc
+
+    # 11. Durably reread and revalidate the final manifest; on failure,
+    # restore the exact original bytes and remove the marked copy.
+    try:
+        with open(final_path, "rb") as handle:
+            final_bytes = handle.read()
+        final_manifest = json.loads(final_bytes)
+        prov.validate_manifest(final_manifest)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError,
+            prov.ProvenanceError) as exc:
+        _restore_draft_manifest(final_path, original_bytes, marked_path,
+                                exc)
+    if final_manifest != rebuilt:
+        _restore_draft_manifest(final_path, original_bytes, marked_path,
+                                None)
+
+    # 12. Immutable finalized information.
+    return RenderLocalFinalizedRender(
+        verified=verified,
+        marked_output_path=marked_path,
+        marked_output_sha256=marked_hash,
+        manifest_path=final_path,
+        manifest=final_manifest,
     )
 
 

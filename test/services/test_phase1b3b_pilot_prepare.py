@@ -31,6 +31,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import pilot_prepare
+import pilot_review
 from app.models import const
 from app.models.schema import VideoAspect, VideoConcatMode
 from app.services import provenance as prov
@@ -2470,6 +2471,782 @@ class TestRenderLocalVerifiedRenderSemantics(_PrepareTestBase):
             for supplied in (output_target, "injected", "CANARY-o8"):
                 self.assertNotIn(supplied, message)
             self.assertEqual(self.tree_snapshot(task_dir), before_tree)
+
+
+# ---------------------------------------------------------------------------
+# Render-local marked-output finalization (happy path)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderLocalMarkedOutputFinalization(_PrepareTestBase):
+    """Happy-path test for _finalize_render_local_marked_output.
+
+    Builds real verified evidence with the existing helpers inside an
+    isolated temporary storage root (pilot_prepare.__file__ points at the
+    sandbox; utils.get_uuid returns a known canonical UUID).
+    """
+
+    KNOWN_TASK_ID = "12345678-1234-5678-1234-567812345678"
+
+    def setUp(self):
+        super().setUp()
+        self._file_patch = patch.object(
+            pilot_prepare,
+            "__file__",
+            os.path.join(self.root, "pilot_prepare.py"),
+        )
+        self._file_patch.start()
+        self._uuid_patch = patch(
+            "app.utils.utils.get_uuid", return_value=self.KNOWN_TASK_ID
+        )
+        self._uuid_patch.start()
+
+    def tearDown(self):
+        self._uuid_patch.stop()
+        self._file_patch.stop()
+        super().tearDown()
+
+    # -- helpers ------------------------------------------------------------
+
+    def write_source(self, name: str, data: bytes) -> str:
+        path = os.path.join(self.root, "src", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def tree_snapshot(self, root):
+        dirs = set()
+        files = {}
+        for dirpath, dirnames, filenames in os.walk(root):
+            for dirname in dirnames:
+                dirs.add(
+                    os.path.relpath(os.path.join(dirpath, dirname), root)
+                )
+            for filename in filenames:
+                full = os.path.join(dirpath, filename)
+                with open(full, "rb") as handle:
+                    files[os.path.relpath(full, root)] = handle.read()
+        return dirs, files
+
+    def build_verified_render(self):
+        """Real validate/load/stage/draft chain plus verified evidence."""
+        script_bytes = b"Bitcoin basics finalization script.\n"
+        script_src = self.write_source("script.txt", script_bytes)
+        material_srcs = [
+            self.write_source("clip-b.mp4", b"material-bytes-b"),
+            self.write_source("clip-a.mp4", b"material-bytes-a"),
+        ]
+        request = pilot_prepare._validate_render_local_request(
+            topic="finalization topic",
+            script_path=script_src,
+            material_paths=material_srcs,
+            license_names=["CC0", "ODbL"],
+            license_evidence=["ref-b", "ref-a"],
+            claims=["Bitcoin supply is capped at 21 million."],
+            claim_sources=["https://bitcoin.org/bitcoin.pdf"],
+        )
+        loaded = pilot_prepare._load_render_local_inputs(request)
+        staged = pilot_prepare._stage_render_local_task(loaded)
+        draft = pilot_prepare._prepare_render_local_draft(staged)
+        task_dir = staged.task_dir
+
+        script_json = {
+            "script": staged.script_text,
+            "params": {
+                "video_script": staged.script_text,
+                "video_source": "local",
+                "video_count": 1,
+                "video_aspect": VideoAspect.landscape.value,
+                "video_concat_mode": VideoConcatMode.sequential.value,
+                "video_clip_duration": 5,
+                "voice_name": voice.NO_VOICE_NAME,
+                "subtitle_enabled": False,
+                "bgm_type": "none",
+                "video_materials": [
+                    {
+                        "provider": "local",
+                        "url": os.path.relpath(staged_path, task_dir),
+                    }
+                    for staged_path, _ in staged.materials
+                ],
+            },
+        }
+        with open(os.path.join(task_dir, "script.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump(script_json, handle)
+
+        output_bytes = b"final-video-bytes\x00\x01\x02\xff"
+        output_target = os.path.join(task_dir, "final-1.mp4")
+        with open(output_target, "wb") as handle:
+            handle.write(output_bytes)
+
+        task_result = {
+            "task_id": staged.task_id,
+            "state": const.TASK_STATE_COMPLETE,
+            "progress": 100,
+            "videos": [os.path.relpath(output_target, task_dir)],
+        }
+        verified = pilot_prepare._verify_render_local_render(
+            draft, task_result
+        )
+        return verified, output_bytes
+
+    # -- happy path -----------------------------------------------------------
+
+    def test_finalize_marked_output_happy_path(self):
+        verified, output_bytes = self.build_verified_render()
+        draft = verified.draft
+        task_dir = draft.staged.task_dir
+
+        before_dirs, before_files = self.tree_snapshot(task_dir)
+        finalized = pilot_prepare._finalize_render_local_marked_output(
+            verified
+        )
+        after_dirs, after_files = self.tree_snapshot(task_dir)
+
+        # Verified evidence is carried through identically.
+        self.assertIs(finalized.verified, verified)
+        self.assertIs(finalized.verified.draft, draft)
+
+        # Original final-1.mp4 remains byte-identical.
+        with open(verified.output_path, "rb") as handle:
+            self.assertEqual(handle.read(), output_bytes)
+
+        # Marked filename comes from provenance.marked_filename.
+        marked_name = prov.marked_filename("final-1.mp4")
+        self.assertEqual(marked_name, "final-1__NEEDS_HUMAN_REVIEW.mp4")
+        self.assertEqual(
+            os.path.basename(finalized.marked_output_path), marked_name
+        )
+        self.assertEqual(
+            os.path.dirname(finalized.marked_output_path), task_dir
+        )
+
+        # Marked bytes/hash equal the original and the verified hash.
+        with open(finalized.marked_output_path, "rb") as handle:
+            self.assertEqual(handle.read(), output_bytes)
+        self.assertEqual(
+            finalized.marked_output_sha256,
+            hashlib.sha256(output_bytes).hexdigest(),
+        )
+        self.assertEqual(
+            finalized.marked_output_sha256, verified.output_sha256
+        )
+
+        # Durable manifest validates and matches the on-disk reread.
+        prov.validate_manifest(finalized.manifest)
+        self.assertEqual(
+            finalized.manifest_path,
+            os.path.join(task_dir, "provenance_manifest.json"),
+        )
+        with open(finalized.manifest_path, encoding="utf-8") as handle:
+            durable_final = json.load(handle)
+        self.assertEqual(durable_final, finalized.manifest)
+
+        # Output section points to the marked file with the correct hash.
+        output = finalized.manifest["output"]
+        self.assertEqual(output["local_path"], marked_name)
+        self.assertEqual(output["sha256"], verified.output_sha256)
+        self.assertEqual(output["filename_marker"], marked_name)
+        self.assertFalse(output["visible_watermark_required"])
+
+        # review_status remains NEEDS_HUMAN_REVIEW everywhere.
+        self.assertEqual(output["review_status"], "NEEDS_HUMAN_REVIEW")
+        self.assertEqual(
+            finalized.manifest["task"]["review_status"],
+            "NEEDS_HUMAN_REVIEW",
+        )
+
+        # Every prepared section and immutable timestamp is preserved.
+        for section in (
+            "task", "script", "assets", "factual_claims", "ai_generations"
+        ):
+            self.assertEqual(
+                finalized.manifest[section], draft.manifest[section]
+            )
+        self.assertEqual(
+            finalized.manifest["task"]["created_at"],
+            draft.manifest["task"]["created_at"],
+        )
+
+        # Only the marked output and the manifest differ from the tree.
+        self.assertEqual(after_dirs, before_dirs)
+        self.assertEqual(
+            set(after_files) - set(before_files), {marked_name}
+        )
+        self.assertEqual(set(before_files) - set(after_files), set())
+        changed = {
+            name
+            for name in before_files
+            if before_files[name] != after_files[name]
+        }
+        self.assertEqual(changed, {"provenance_manifest.json"})
+
+        # pilot_review status/audit assembly accepts the task.
+        state = pilot_review._assemble_state(task_dir)
+        self.assertEqual(state.get("failures"), [])
+        self.assertEqual(state.get("script_status"), "ok")
+        self.assertEqual(state.get("asset_statuses"), ["ok", "ok"])
+        self.assertEqual(state.get("output_status"), "ok")
+
+        # Returned dataclass is immutable.
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            finalized.marked_output_sha256 = "mutated"
+
+    # -- pre-mutation refusal: marked target already exists -------------------
+
+    def test_finalize_refuses_existing_marked_output(self):
+        verified, output_bytes = self.build_verified_render()
+        draft = verified.draft
+        task_dir = draft.staged.task_dir
+
+        # Pre-create the exact marked target with canary bytes.
+        marked_name = prov.marked_filename("final-1.mp4")
+        marked_path = os.path.join(task_dir, marked_name)
+        canary = b"preexisting-marked-CANARY-mx1"
+        with open(marked_path, "wb") as handle:
+            handle.write(canary)
+        with open(draft.manifest_path, "rb") as handle:
+            manifest_before = handle.read()
+        before_dirs, before_files = self.tree_snapshot(task_dir)
+
+        with patch("shutil.rmtree") as rmtree_mock:
+            with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                pilot_prepare._finalize_render_local_marked_output(verified)
+
+        # Exact static refusal; no canary or path leaks into the message.
+        message = str(ctx.exception)
+        self.assertEqual(
+            message, "render-local marked output already exists"
+        )
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertNotIn("CANARY-mx1", message)
+        self.assertNotIn(marked_name, message)
+        self.assertNotIn(marked_path, message)
+        rmtree_mock.assert_not_called()
+
+        # Complete task tree is byte-for-byte unchanged.
+        after_dirs, after_files = self.tree_snapshot(task_dir)
+        self.assertEqual(after_dirs, before_dirs)
+        self.assertEqual(after_files, before_files)
+
+        # Pre-existing marked file unchanged.
+        with open(marked_path, "rb") as handle:
+            self.assertEqual(handle.read(), canary)
+
+        # Original final-1.mp4 unchanged.
+        with open(verified.output_path, "rb") as handle:
+            self.assertEqual(handle.read(), output_bytes)
+
+        # Manifest unchanged (still the prepared draft evidence).
+        with open(draft.manifest_path, "rb") as handle:
+            self.assertEqual(handle.read(), manifest_before)
+
+    # -- pre-replacement refusal: verified output hash drifted ----------------
+
+    def test_finalize_refuses_output_hash_drift(self):
+        verified, output_bytes = self.build_verified_render()
+        draft = verified.draft
+        task_dir = draft.staged.task_dir
+
+        # Drift the verified output bytes after verification.
+        drifted = b"drifted-output-CANARY-d1"
+        self.assertNotEqual(drifted, output_bytes)
+        with open(verified.output_path, "wb") as handle:
+            handle.write(drifted)
+        with open(draft.manifest_path, "rb") as handle:
+            manifest_before = handle.read()
+        before_dirs, before_files = self.tree_snapshot(task_dir)
+
+        with patch("shutil.rmtree") as rmtree_mock:
+            with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                pilot_prepare._finalize_render_local_marked_output(verified)
+
+        # Exact static refusal; no drifted bytes or paths leak.
+        message = str(ctx.exception)
+        self.assertEqual(
+            message,
+            "render-local verified output hash changed since verification",
+        )
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertNotIn("CANARY-d1", message)
+        self.assertNotIn(verified.output_path, message)
+        self.assertNotIn(
+            prov.marked_filename("final-1.mp4"), message
+        )
+        rmtree_mock.assert_not_called()
+
+        # Complete task tree is byte-for-byte unchanged.
+        after_dirs, after_files = self.tree_snapshot(task_dir)
+        self.assertEqual(after_dirs, before_dirs)
+        self.assertEqual(after_files, before_files)
+
+        # Altered final-1.mp4 is preserved untouched.
+        with open(verified.output_path, "rb") as handle:
+            self.assertEqual(handle.read(), drifted)
+
+        # No marked output was created (copied target unlinked).
+        marked_path = os.path.join(
+            task_dir, prov.marked_filename("final-1.mp4")
+        )
+        self.assertFalse(os.path.lexists(marked_path))
+
+        # Manifest byte-for-byte unchanged.
+        with open(draft.manifest_path, "rb") as handle:
+            self.assertEqual(handle.read(), manifest_before)
+
+    # -- pre-mutation refusal: durable manifest drifted -----------------------
+
+    def test_finalize_refuses_durable_manifest_drift(self):
+        verified, output_bytes = self.build_verified_render()
+        draft = verified.draft
+        task_dir = draft.staged.task_dir
+
+        # Drift one non-secret manifest field, keeping it schema-valid.
+        with open(draft.manifest_path, encoding="utf-8") as handle:
+            durable = json.load(handle)
+        durable["task"]["topic"] = "drifted topic CANARY-mf1"
+        prov.write_manifest_atomic(task_dir, durable)
+        with open(draft.manifest_path, "rb") as handle:
+            altered_manifest = handle.read()
+        before_dirs, before_files = self.tree_snapshot(task_dir)
+
+        with patch("shutil.rmtree") as rmtree_mock:
+            with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                pilot_prepare._finalize_render_local_marked_output(verified)
+
+        # Exact static refusal; no altered value or paths leak.
+        message = str(ctx.exception)
+        self.assertEqual(
+            message,
+            "render-local durable manifest disagrees with the prepared "
+            "draft",
+        )
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertNotIn("CANARY-mf1", message)
+        self.assertNotIn("drifted topic", message)
+        self.assertNotIn(draft.manifest_path, message)
+        rmtree_mock.assert_not_called()
+
+        # Complete task tree is byte-for-byte unchanged.
+        after_dirs, after_files = self.tree_snapshot(task_dir)
+        self.assertEqual(after_dirs, before_dirs)
+        self.assertEqual(after_files, before_files)
+
+        # Altered durable manifest is preserved exactly.
+        with open(draft.manifest_path, "rb") as handle:
+            self.assertEqual(handle.read(), altered_manifest)
+
+        # Original final-1.mp4 unchanged.
+        with open(verified.output_path, "rb") as handle:
+            self.assertEqual(handle.read(), output_bytes)
+
+        # No marked output was created.
+        marked_path = os.path.join(
+            task_dir, prov.marked_filename("final-1.mp4")
+        )
+        self.assertFalse(os.path.lexists(marked_path))
+
+    # -- pre-mutation refusal: durable script hash drifted --------------------
+
+    def test_finalize_refuses_durable_script_drift(self):
+        verified, output_bytes = self.build_verified_render()
+        draft = verified.draft
+        staged = draft.staged
+        task_dir = staged.task_dir
+
+        # Drift the staged script bytes after verification (valid UTF-8).
+        drifted_script = b"drifted script CANARY-s1\n"
+        with open(staged.script_path, "wb") as handle:
+            handle.write(drifted_script)
+        with open(draft.manifest_path, "rb") as handle:
+            manifest_before = handle.read()
+        before_dirs, before_files = self.tree_snapshot(task_dir)
+
+        with patch("shutil.rmtree") as rmtree_mock:
+            with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                pilot_prepare._finalize_render_local_marked_output(verified)
+
+        # Exact static refusal; no altered content or paths leak.
+        message = str(ctx.exception)
+        self.assertEqual(
+            message,
+            "render-local staged script hash changed since preparation",
+        )
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertNotIn("CANARY-s1", message)
+        self.assertNotIn(staged.script_path, message)
+        rmtree_mock.assert_not_called()
+
+        # Complete task tree is byte-for-byte unchanged.
+        after_dirs, after_files = self.tree_snapshot(task_dir)
+        self.assertEqual(after_dirs, before_dirs)
+        self.assertEqual(after_files, before_files)
+
+        # Altered script is preserved exactly.
+        with open(staged.script_path, "rb") as handle:
+            self.assertEqual(handle.read(), drifted_script)
+
+        # Durable manifest unchanged.
+        with open(draft.manifest_path, "rb") as handle:
+            self.assertEqual(handle.read(), manifest_before)
+
+        # Original final-1.mp4 unchanged.
+        with open(verified.output_path, "rb") as handle:
+            self.assertEqual(handle.read(), output_bytes)
+
+        # No marked output was created.
+        marked_path = os.path.join(
+            task_dir, prov.marked_filename("final-1.mp4")
+        )
+        self.assertFalse(os.path.lexists(marked_path))
+
+    # -- pre-mutation refusal: durable material hash drifted ------------------
+
+    def test_finalize_refuses_durable_material_drift(self):
+        verified, output_bytes = self.build_verified_render()
+        draft = verified.draft
+        staged = draft.staged
+        task_dir = staged.task_dir
+
+        # Drift one task-local material after verification.
+        target_path, _target_hash = staged.materials[0]
+        other_path, _other_hash = staged.materials[1]
+        drifted_material = b"drifted-material-CANARY-m1"
+        with open(other_path, "rb") as handle:
+            other_before = handle.read()
+        with open(target_path, "wb") as handle:
+            handle.write(drifted_material)
+        with open(draft.manifest_path, "rb") as handle:
+            manifest_before = handle.read()
+        before_dirs, before_files = self.tree_snapshot(task_dir)
+
+        with patch("shutil.rmtree") as rmtree_mock:
+            with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                pilot_prepare._finalize_render_local_marked_output(verified)
+
+        # Exact static refusal; no altered content or paths leak.
+        message = str(ctx.exception)
+        self.assertEqual(
+            message,
+            "render-local staged material hash changed since preparation",
+        )
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertNotIn("CANARY-m1", message)
+        self.assertNotIn(target_path, message)
+        rmtree_mock.assert_not_called()
+
+        # Complete task tree is byte-for-byte unchanged.
+        after_dirs, after_files = self.tree_snapshot(task_dir)
+        self.assertEqual(after_dirs, before_dirs)
+        self.assertEqual(after_files, before_files)
+
+        # Altered material is preserved exactly; the other is unchanged.
+        with open(target_path, "rb") as handle:
+            self.assertEqual(handle.read(), drifted_material)
+        with open(other_path, "rb") as handle:
+            self.assertEqual(handle.read(), other_before)
+
+        # Durable manifest unchanged.
+        with open(draft.manifest_path, "rb") as handle:
+            self.assertEqual(handle.read(), manifest_before)
+
+        # Original final-1.mp4 unchanged.
+        with open(verified.output_path, "rb") as handle:
+            self.assertEqual(handle.read(), output_bytes)
+
+        # No marked output was created.
+        marked_path = os.path.join(
+            task_dir, prov.marked_filename("final-1.mp4")
+        )
+        self.assertFalse(os.path.lexists(marked_path))
+
+    # -- injected failure during the marked-output copy -----------------------
+
+    def test_finalize_copy_failure_preserves_draft(self):
+        verified, output_bytes = self.build_verified_render()
+        draft = verified.draft
+        task_dir = draft.staged.task_dir
+        marked_name = prov.marked_filename("final-1.mp4")
+        marked_path = os.path.join(task_dir, marked_name)
+
+        with open(draft.manifest_path, "rb") as handle:
+            manifest_before = handle.read()
+        before_dirs, before_files = self.tree_snapshot(task_dir)
+
+        # Fail only the narrow marked-output copy seam.
+        real_write = pilot_prepare._atomic_write_stream
+
+        def flaky(target, chunks):
+            if target.endswith(marked_name):
+                raise OSError("injected copy failure CANARY-c1")
+            return real_write(target, chunks)
+
+        with patch("shutil.rmtree") as rmtree_mock:
+            with patch.object(
+                pilot_prepare, "_atomic_write_stream", side_effect=flaky
+            ):
+                with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                    pilot_prepare._finalize_render_local_marked_output(
+                        verified
+                    )
+
+        # Exact static refusal; native failure survives only as the cause.
+        message = str(ctx.exception)
+        self.assertEqual(message, "render-local finalization failed")
+        self.assertIsInstance(ctx.exception.__cause__, OSError)
+        self.assertNotIn("CANARY-c1", message)
+        self.assertNotIn("injected copy failure", message)
+        self.assertNotIn(marked_name, message)
+        self.assertNotIn(marked_path, message)
+        rmtree_mock.assert_not_called()
+
+        # Complete task tree is byte-for-byte unchanged.
+        after_dirs, after_files = self.tree_snapshot(task_dir)
+        self.assertEqual(after_dirs, before_dirs)
+        self.assertEqual(after_files, before_files)
+
+        # Original final-1.mp4 unchanged; manifest/evidence unchanged.
+        with open(verified.output_path, "rb") as handle:
+            self.assertEqual(handle.read(), output_bytes)
+        with open(draft.manifest_path, "rb") as handle:
+            self.assertEqual(handle.read(), manifest_before)
+
+        # No marked output or temporary file survives.
+        self.assertFalse(os.path.lexists(marked_path))
+
+    # -- injected failure hashing the newly marked output ---------------------
+
+    def test_finalize_marked_hash_failure_preserves_draft(self):
+        verified, output_bytes = self.build_verified_render()
+        draft = verified.draft
+        task_dir = draft.staged.task_dir
+        marked_name = prov.marked_filename("final-1.mp4")
+        marked_path = os.path.join(task_dir, marked_name)
+
+        with open(draft.manifest_path, "rb") as handle:
+            manifest_before = handle.read()
+        before_dirs, before_files = self.tree_snapshot(task_dir)
+
+        # Fail only hashing the newly marked output; other hashing is real.
+        real_hash = prov.sha256_file_streamed
+
+        def flaky_hash(path, *args, **kwargs):
+            if str(path).endswith(marked_name):
+                raise OSError("injected hash failure CANARY-h1")
+            return real_hash(path, *args, **kwargs)
+
+        with patch("shutil.rmtree") as rmtree_mock:
+            with patch.object(
+                prov, "sha256_file_streamed", side_effect=flaky_hash
+            ):
+                with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                    pilot_prepare._finalize_render_local_marked_output(
+                        verified
+                    )
+
+        # Exact static refusal; native failure survives only as the cause.
+        message = str(ctx.exception)
+        self.assertEqual(message, "render-local finalization failed")
+        self.assertIsInstance(ctx.exception.__cause__, OSError)
+        self.assertNotIn("CANARY-h1", message)
+        self.assertNotIn("injected hash failure", message)
+        self.assertNotIn(marked_name, message)
+        self.assertNotIn(marked_path, message)
+        rmtree_mock.assert_not_called()
+
+        # Complete task tree restored byte-for-byte.
+        after_dirs, after_files = self.tree_snapshot(task_dir)
+        self.assertEqual(after_dirs, before_dirs)
+        self.assertEqual(after_files, before_files)
+
+        # Original final-1.mp4 unchanged; manifest/evidence unchanged.
+        with open(verified.output_path, "rb") as handle:
+            self.assertEqual(handle.read(), output_bytes)
+        with open(draft.manifest_path, "rb") as handle:
+            self.assertEqual(handle.read(), manifest_before)
+
+        # Created marked output and all temps are removed.
+        self.assertFalse(os.path.lexists(marked_path))
+
+    # -- injected failure building the output section -------------------------
+
+    def test_finalize_output_builder_failure_preserves_draft(self):
+        verified, output_bytes = self.build_verified_render()
+        draft = verified.draft
+        task_dir = draft.staged.task_dir
+        marked_name = prov.marked_filename("final-1.mp4")
+        marked_path = os.path.join(task_dir, marked_name)
+
+        with open(draft.manifest_path, "rb") as handle:
+            manifest_before = handle.read()
+        before_dirs, before_files = self.tree_snapshot(task_dir)
+
+        with patch("shutil.rmtree") as rmtree_mock:
+            with patch.object(
+                prov,
+                "build_output_section",
+                side_effect=prov.ProvenanceError(
+                    "injected builder failure CANARY-b1"
+                ),
+            ):
+                with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                    pilot_prepare._finalize_render_local_marked_output(
+                        verified
+                    )
+
+        # Exact static refusal; native failure survives only as the cause.
+        message = str(ctx.exception)
+        self.assertEqual(message, "render-local finalization failed")
+        self.assertIsInstance(ctx.exception.__cause__, prov.ProvenanceError)
+        self.assertNotIn("CANARY-b1", message)
+        self.assertNotIn("injected builder failure", message)
+        self.assertNotIn(marked_name, message)
+        self.assertNotIn(marked_path, message)
+        rmtree_mock.assert_not_called()
+
+        # Complete task tree restored byte-for-byte.
+        after_dirs, after_files = self.tree_snapshot(task_dir)
+        self.assertEqual(after_dirs, before_dirs)
+        self.assertEqual(after_files, before_files)
+
+        # Original final-1.mp4 unchanged; manifest/evidence unchanged.
+        with open(verified.output_path, "rb") as handle:
+            self.assertEqual(handle.read(), output_bytes)
+        with open(draft.manifest_path, "rb") as handle:
+            self.assertEqual(handle.read(), manifest_before)
+
+        # Created marked output and all temps are removed.
+        self.assertFalse(os.path.lexists(marked_path))
+
+    # -- injected failure during the atomic manifest replacement --------------
+
+    def test_finalize_manifest_write_failure_preserves_draft(self):
+        verified, output_bytes = self.build_verified_render()
+        draft = verified.draft
+        task_dir = draft.staged.task_dir
+        marked_name = prov.marked_filename("final-1.mp4")
+        marked_path = os.path.join(task_dir, marked_name)
+
+        with open(draft.manifest_path, "rb") as handle:
+            manifest_before = handle.read()
+        before_dirs, before_files = self.tree_snapshot(task_dir)
+
+        with patch("shutil.rmtree") as rmtree_mock:
+            with patch.object(
+                prov,
+                "write_manifest_atomic",
+                side_effect=OSError(
+                    "injected manifest write failure CANARY-w1"
+                ),
+            ):
+                with self.assertRaises(pilot_prepare.PrepareError) as ctx:
+                    pilot_prepare._finalize_render_local_marked_output(
+                        verified
+                    )
+
+        # Exact static refusal; native failure survives only as the cause.
+        message = str(ctx.exception)
+        self.assertEqual(message, "render-local finalization failed")
+        self.assertIsInstance(ctx.exception.__cause__, OSError)
+        self.assertNotIn("CANARY-w1", message)
+        self.assertNotIn("injected manifest write failure", message)
+        self.assertNotIn(marked_name, message)
+        self.assertNotIn(marked_path, message)
+        self.assertNotIn(draft.manifest_path, message)
+        rmtree_mock.assert_not_called()
+
+        # Complete task tree restored byte-for-byte.
+        after_dirs, after_files = self.tree_snapshot(task_dir)
+        self.assertEqual(after_dirs, before_dirs)
+        self.assertEqual(after_files, before_files)
+
+        # Original manifest bytes unchanged.
+        with open(draft.manifest_path, "rb") as handle:
+            self.assertEqual(handle.read(), manifest_before)
+
+        # Original final-1.mp4 and prepared evidence unchanged.
+        with open(verified.output_path, "rb") as handle:
+            self.assertEqual(handle.read(), output_bytes)
+
+        # Created marked output and all temps are removed.
+        self.assertFalse(os.path.lexists(marked_path))
+
+    # -- injected failure during post-replacement durable verification --------
+
+    def test_finalize_durable_verification_failure_restores_draft(self):
+        verified, output_bytes = self.build_verified_render()
+        draft = verified.draft
+        task_dir = draft.staged.task_dir
+        marked_name = prov.marked_filename("final-1.mp4")
+        marked_path = os.path.join(task_dir, marked_name)
+
+        with open(draft.manifest_path, "rb") as handle:
+            manifest_before = handle.read()
+        before_dirs, before_files = self.tree_snapshot(task_dir)
+
+        # Fail only the durable verification after the finalized manifest
+        # has replaced the draft; restoration uses the real implementation.
+        real_validate = prov.validate_manifest
+        real_write = prov.write_manifest_atomic
+        replaced = []
+
+        def tracking_write(*args, **kwargs):
+            result = real_write(*args, **kwargs)
+            replaced.append(True)
+            return result
+
+        def flaky_validate(manifest):
+            if replaced and manifest.get("output") is not None:
+                raise prov.ProvenanceError(
+                    "injected durable verification failure CANARY-v1"
+                )
+            return real_validate(manifest)
+
+        with patch("shutil.rmtree") as rmtree_mock:
+            with patch.object(
+                prov, "write_manifest_atomic", side_effect=tracking_write
+            ):
+                with patch.object(
+                    prov, "validate_manifest", side_effect=flaky_validate
+                ):
+                    with self.assertRaises(
+                        pilot_prepare.PrepareError
+                    ) as ctx:
+                        pilot_prepare._finalize_render_local_marked_output(
+                            verified
+                        )
+
+        # The finalized manifest replacement was reached.
+        self.assertTrue(replaced)
+
+        # Exact static refusal; injected failure survives only as the cause.
+        message = str(ctx.exception)
+        self.assertEqual(message, "render-local finalization failed")
+        self.assertIsInstance(ctx.exception.__cause__, prov.ProvenanceError)
+        self.assertNotIn("CANARY-v1", message)
+        self.assertNotIn("injected durable verification failure", message)
+        self.assertNotIn(marked_name, message)
+        self.assertNotIn(marked_path, message)
+        self.assertNotIn(draft.manifest_path, message)
+        rmtree_mock.assert_not_called()
+
+        # Original manifest restored byte-for-byte and validates.
+        with open(draft.manifest_path, "rb") as handle:
+            restored_bytes = handle.read()
+        self.assertEqual(restored_bytes, manifest_before)
+        prov.validate_manifest(json.loads(restored_bytes))
+
+        # Marked output removed; original final and evidence unchanged.
+        self.assertFalse(os.path.lexists(marked_path))
+        with open(verified.output_path, "rb") as handle:
+            self.assertEqual(handle.read(), output_bytes)
+
+        # Complete tree restored byte-for-byte; no temps survive.
+        after_dirs, after_files = self.tree_snapshot(task_dir)
+        self.assertEqual(after_dirs, before_dirs)
+        self.assertEqual(after_files, before_files)
 
 
 if __name__ == "__main__":
