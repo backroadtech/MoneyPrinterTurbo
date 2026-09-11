@@ -3347,13 +3347,16 @@ class TestBuildRenderLocalVideoParams(_PrepareTestBase):
             [m.provider for m in params.video_materials],
             ["local", "local"],
         )
+        # Exact absolute staged paths in original order — no relpath;
+        # external source paths never enter VideoParams.
         self.assertEqual(
             [m.url for m in params.video_materials],
-            [
-                os.path.relpath(staged_paths[0], task_dir),
-                os.path.relpath(staged_paths[1], task_dir),
-            ],
+            [staged_paths[0], staged_paths[1]],
         )
+        serialized = repr(params)
+        self.assertNotIn("src/script.txt", serialized)
+        self.assertNotIn("src/clip-b.mp4", serialized)
+        self.assertNotIn("src/clip-a.mp4", serialized)
         self.assertEqual(params.video_count, 1)
         self.assertEqual(params.video_aspect, VideoAspect.landscape.value)
         self.assertEqual(
@@ -3816,9 +3819,12 @@ class TestRunRenderLocalTaskOrchestration(_PrepareTestBase):
             self.assertEqual(
                 [m.provider for m in params.video_materials], ["local"]
             )
+            expected_staged = os.path.realpath(
+                os.path.join(task_dir, "materials", "clip-a.mp4")
+            )
             self.assertEqual(
                 [m.url for m in params.video_materials],
-                [os.path.join("materials", "clip-a.mp4")],
+                [expected_staged],
             )
             self.assertEqual(params.video_count, 1)
             self.assertEqual(
@@ -4000,6 +4006,28 @@ class TestRunRenderLocalTaskOrchestration(_PrepareTestBase):
             self.assertEqual(handle.read(), script_bytes)
         with open(material_src, "rb") as handle:
             self.assertEqual(handle.read(), material_bytes)
+
+        # script.json serializes the absolute task-local path; the
+        # external source paths never enter it.
+        with open(
+            os.path.join(task_dir, "script.json"), encoding="utf-8"
+        ) as handle:
+            script_json_doc = json.load(handle)
+        self.assertEqual(
+            [
+                entry["url"]
+                for entry in script_json_doc["params"]["video_materials"]
+            ],
+            [
+                os.path.realpath(
+                    os.path.join(task_dir, "materials", "clip-a.mp4")
+                )
+            ],
+        )
+        serialized_script_json = json.dumps(script_json_doc)
+        self.assertNotIn(src_dir, serialized_script_json)
+        self.assertNotIn(script_src, serialized_script_json)
+        self.assertNotIn(material_src, serialized_script_json)
 
         # pilot_review status/audit assembly accepts the task.
         state = pilot_review._assemble_state(task_dir)

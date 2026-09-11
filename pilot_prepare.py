@@ -714,7 +714,6 @@ def _build_render_local_video_params(
     from app.services import voice
 
     staged = draft.staged
-    task_dir = staged.task_dir
     return VideoParams(
         video_subject=staged.loaded.request.topic,
         video_script=staged.script_text,
@@ -722,7 +721,7 @@ def _build_render_local_video_params(
         video_materials=[
             MaterialInfo(
                 provider="local",
-                url=os.path.relpath(staged_path, task_dir),
+                url=staged_path,
             )
             for staged_path, _staged_hash in staged.materials
         ],
