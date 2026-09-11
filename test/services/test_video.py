@@ -1228,6 +1228,104 @@ class TestVideoService(unittest.TestCase):
                     self.assertEqual(result, "/some/output/dir")
 
 
+class TestPreprocessVideoExtraRoots(unittest.TestCase):
+    """Optional extra allowed-root confinement for preprocess_video.
+
+    The extra root is additive and opt-in: the default call keeps its
+    exact storage/local_videos behavior, while extra-root candidates
+    must be absolute, link-free, direct-child regular files under an
+    explicitly resolved approved root. Temp fixtures only — no
+    network, and no deletion or mutation outside temp dirs.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.base_tmp = os.path.realpath(cls._tmp.name)
+        cls.base_clip = os.path.join(cls.base_tmp, "base.mp4")
+        from moviepy import ColorClip
+
+        clip = ColorClip(size=(1280, 720), color=(32, 64, 128), duration=1)
+        try:
+            clip.write_videofile(cls.base_clip, fps=30, logger=None)
+        finally:
+            clip.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def setUp(self):
+        self.root = os.path.join(self.base_tmp, self.id().split(".")[-1])
+        os.makedirs(self.root)
+        self.clip = os.path.join(self.root, "xroot-clip-001.mp4")
+        shutil.copy2(self.base_clip, self.clip)
+
+    def _run(self, url, roots):
+        material = MaterialInfo(provider="local", url=url)
+        return vd.preprocess_video(
+            [material], clip_duration=4, extra_allowed_roots=roots
+        )
+
+    def test_default_behavior_unchanged(self):
+        self.assertEqual(self._run(self.clip, ()), [])
+
+    def test_absolute_direct_child_accepted(self):
+        materials = self._run(self.clip, (self.root,))
+        self.assertEqual(len(materials), 1)
+        self.assertEqual(materials[0].url, os.path.realpath(self.clip))
+
+    def test_relative_path_rejected(self):
+        self.assertEqual(self._run("xroot-clip-001.mp4", (self.root,)), [])
+
+    def test_outside_path_rejected(self):
+        outside = os.path.join(self.base_tmp, "outside-clip.mp4")
+        shutil.copy2(self.base_clip, outside)
+        self.assertEqual(self._run(outside, (self.root,)), [])
+
+    def test_traversal_rejected(self):
+        outside = os.path.join(self.base_tmp, "trav-clip.mp4")
+        shutil.copy2(self.base_clip, outside)
+        sneaky = os.path.join(self.root, "..", "trav-clip.mp4")
+        self.assertEqual(self._run(sneaky, (self.root,)), [])
+
+    def test_nested_subdirectory_rejected(self):
+        sub = os.path.join(self.root, "sub")
+        os.makedirs(sub)
+        nested = os.path.join(sub, "xroot-clip-001.mp4")
+        shutil.copy2(self.clip, nested)
+        self.assertEqual(self._run(nested, (self.root,)), [])
+
+    def test_missing_and_directory_rejected(self):
+        missing = os.path.join(self.root, "missing.mp4")
+        self.assertEqual(self._run(missing, (self.root,)), [])
+        subdir = os.path.join(self.root, "adir")
+        os.makedirs(subdir)
+        self.assertEqual(self._run(subdir, (self.root,)), [])
+
+    def test_junction_rejected(self):
+        import subprocess
+
+        target_dir = os.path.join(self.base_tmp, "jtarget")
+        os.makedirs(target_dir, exist_ok=True)
+        shutil.copy2(
+            self.base_clip, os.path.join(target_dir, "xroot-clip-001.mp4")
+        )
+        link = os.path.join(self.root, "jlink")
+        try:
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", link, target_dir],
+                check=True,
+                capture_output=True,
+            )
+        except Exception as exc:
+            self.skipTest(f"junction not available: {exc}")
+        self.assertEqual(
+            self._run(os.path.join(link, "xroot-clip-001.mp4"), (self.root,)),
+            [],
+        )
+
+
 class TestMaterialResolutionTolerance(unittest.TestCase):
     def test_accepts_material_at_the_nominal_minimum(self):
         self.assertTrue(vd.is_material_resolution_acceptable(480, 480))
