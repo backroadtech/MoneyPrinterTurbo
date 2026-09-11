@@ -4009,5 +4009,329 @@ class TestRunRenderLocalTaskOrchestration(_PrepareTestBase):
         self.assertEqual(state.get("output_status"), "ok")
 
 
+# ---------------------------------------------------------------------------
+# Render-local CLI dispatch (orchestrator stubbed)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderLocalCLI(_PrepareTestBase):
+    """CLI render-local dispatch and output-contract tests."""
+
+    def test_render_local_cli_dispatches_ordered_request(self):
+        import io
+
+        task_dir = os.path.join("storage", "tasks", "task-cli-001")
+        finalized = unittest.mock.Mock()
+        finalized.verified.draft.staged.task_id = "task-cli-001"
+        finalized.verified.draft.staged.task_dir = task_dir
+        finalized.manifest_path = os.path.join(
+            task_dir, "provenance_manifest.json"
+        )
+        finalized.marked_output_path = os.path.join(
+            task_dir, "final-1__NEEDS_HUMAN_REVIEW.mp4"
+        )
+
+        argv = [
+            "render-local",
+            "--topic", "cli topic CANARY-t1",
+            "--script", "ext/script.txt",
+            "--material", "ext/clip-z.mp4",
+            "--license-name", "Zlib",
+            "--license-evidence", "ref-z",
+            "--material", "ext/clip-a.mp4",
+            "--license-name", "Apache",
+            "--license-evidence", "ref-a",
+            "--claim", "zz claim CANARY-t2",
+            "--claim-source", "https://example.org/zz",
+            "--claim", "aa claim CANARY-t3",
+            "--claim-source", "https://example.org/aa",
+        ]
+
+        before = {
+            name
+            for name in sys.modules
+            if name.startswith("app.services.task")
+        }
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch.object(
+            pilot_prepare,
+            "_run_render_local_task",
+            return_value=finalized,
+        ) as orch_mock, patch.object(
+            pilot_prepare, "prepare"
+        ) as prepare_mock, patch(
+            "sys.stdout", stdout
+        ), patch(
+            "sys.stderr", stderr
+        ):
+            code = pilot_prepare.run(argv)
+        after = {
+            name
+            for name in sys.modules
+            if name.startswith("app.services.task")
+        }
+
+        # Exit 0, exactly one dispatch, prepare untouched, no task import.
+        self.assertEqual(code, 0)
+        orch_mock.assert_called_once_with(
+            topic="cli topic CANARY-t1",
+            script_path="ext/script.txt",
+            material_paths=["ext/clip-z.mp4", "ext/clip-a.mp4"],
+            license_names=["Zlib", "Apache"],
+            license_evidence=["ref-z", "ref-a"],
+            claims=["zz claim CANARY-t2", "aa claim CANARY-t3"],
+            claim_sources=[
+                "https://example.org/zz",
+                "https://example.org/aa",
+            ],
+        )
+        prepare_mock.assert_not_called()
+        self.assertEqual(after - before, set())
+
+        # stderr is empty; stdout is byte-exact and minimal.
+        self.assertEqual(stderr.getvalue(), "")
+        expected_stdout = (
+            "BrainTrustCrypto pilot render-local finalized\n"
+            "  task_id:   task-cli-001\n"
+            "  manifest:  provenance_manifest.json\n"
+            "  output:    final-1__NEEDS_HUMAN_REVIEW.mp4\n"
+        )
+        self.assertEqual(stdout.getvalue(), expected_stdout)
+
+        # stdout carries no request content, external paths, or errors.
+        out = stdout.getvalue()
+        for leaked in (
+            "CANARY-t1",
+            "cli topic",
+            "ext/script.txt",
+            "clip-z",
+            "clip-a",
+            "Zlib",
+            "Apache",
+            "ref-z",
+            "ref-a",
+            "zz claim",
+            "aa claim",
+            "example.org",
+            "Traceback",
+            "OSError",
+            "error",
+        ):
+            self.assertNotIn(leaked, out)
+
+    def test_render_local_cli_missing_required_arguments_refused(self):
+        import io
+
+        cases = {
+            "--topic": "cli topic CANARY-r1",
+            "--script": "ext/script.txt",
+            "--material": "ext/clip.mp4",
+            "--license-name": "Zlib",
+            "--license-evidence": "ref-z",
+        }
+        for omitted in cases:
+            with self.subTest(case=omitted):
+                argv = ["render-local"]
+                for flag, value in cases.items():
+                    if flag != omitted:
+                        argv.extend([flag, value])
+
+                before = {
+                    name
+                    for name in sys.modules
+                    if name.startswith("app.services.task")
+                }
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with patch.object(
+                    pilot_prepare, "_run_render_local_task"
+                ) as orch_mock, patch.object(
+                    pilot_prepare, "prepare"
+                ) as prepare_mock, patch(
+                    "sys.stdout", stdout
+                ), patch(
+                    "sys.stderr", stderr
+                ):
+                    with self.assertRaises(SystemExit) as raised:
+                        pilot_prepare.run(argv)
+                after = {
+                    name
+                    for name in sys.modules
+                    if name.startswith("app.services.task")
+                }
+
+                # argparse refusal: exit 2, no dispatch of any kind.
+                self.assertEqual(raised.exception.code, 2)
+                orch_mock.assert_not_called()
+                prepare_mock.assert_not_called()
+                self.assertEqual(after - before, set())
+
+                # stdout stays empty; nothing leaks into either stream.
+                self.assertEqual(stdout.getvalue(), "")
+                for stream in (stdout.getvalue(), stderr.getvalue()):
+                    for leaked in (
+                        "CANARY-r1",
+                        "ext/script.txt",
+                        "clip.mp4",
+                        "Zlib",
+                        "ref-z",
+                        "Traceback",
+                        "OSError",
+                        "FileNotFoundError",
+                    ):
+                        self.assertNotIn(leaked, stream)
+
+    def test_render_local_cli_foreign_render_options_refused(self):
+        import io
+
+        valid_argv = [
+            "render-local",
+            "--topic", "cli topic CANARY-f1",
+            "--script", "ext/script.txt",
+            "--material", "ext/clip.mp4",
+            "--license-name", "Zlib",
+            "--license-evidence", "ref-z",
+        ]
+        for foreign in (
+            "--task-id",
+            "--video-aspect",
+            "--voice-name",
+            "--video-count",
+        ):
+            with self.subTest(case=foreign):
+                argv = valid_argv + [foreign]
+
+                before = {
+                    name
+                    for name in sys.modules
+                    if name.startswith("app.services.task")
+                }
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with patch.object(
+                    pilot_prepare, "_run_render_local_task"
+                ) as orch_mock, patch.object(
+                    pilot_prepare, "prepare"
+                ) as prepare_mock, patch(
+                    "sys.stdout", stdout
+                ), patch(
+                    "sys.stderr", stderr
+                ):
+                    with self.assertRaises(SystemExit) as raised:
+                        pilot_prepare.run(argv)
+                after = {
+                    name
+                    for name in sys.modules
+                    if name.startswith("app.services.task")
+                }
+
+                # argparse refusal: exit 2, stderr names the foreign flag.
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(foreign, stderr.getvalue())
+                orch_mock.assert_not_called()
+                prepare_mock.assert_not_called()
+                self.assertEqual(after - before, set())
+
+                # stdout stays empty; no canary or native text leaks.
+                self.assertEqual(stdout.getvalue(), "")
+                for stream in (stdout.getvalue(), stderr.getvalue()):
+                    for leaked in (
+                        "CANARY-f1",
+                        "ext/script.txt",
+                        "clip.mp4",
+                        "Zlib",
+                        "ref-z",
+                        "Traceback",
+                        "OSError",
+                        "FileNotFoundError",
+                    ):
+                        self.assertNotIn(leaked, stream)
+
+    def test_render_local_cli_prepare_error_is_sanitized(self):
+        import io
+
+        argv = [
+            "render-local",
+            "--topic", "cli topic CANARY-e1",
+            "--script", "ext/script.txt",
+            "--material", "ext/clip.mp4",
+            "--license-name", "Zlib",
+            "--license-evidence", "ref-z",
+        ]
+
+        def _raise(*args, **kwargs):
+            try:
+                raise OSError(
+                    2, "open /secret/dir/TOKEN-E9/script.txt failed"
+                )
+            except OSError as native:
+                raise pilot_prepare.PrepareError(
+                    "script validation failed"
+                ) from native
+
+        before = {
+            name
+            for name in sys.modules
+            if name.startswith("app.services.task")
+        }
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch.object(
+            pilot_prepare,
+            "_run_render_local_task",
+            side_effect=_raise,
+        ) as orch_mock, patch.object(
+            pilot_prepare, "prepare"
+        ) as prepare_mock, patch(
+            "sys.stdout", stdout
+        ), patch(
+            "sys.stderr", stderr
+        ):
+            code = pilot_prepare.run(argv)
+        after = {
+            name
+            for name in sys.modules
+            if name.startswith("app.services.task")
+        }
+
+        # Exit 1, exactly one dispatch, prepare untouched, no task import.
+        self.assertEqual(code, 1)
+        orch_mock.assert_called_once_with(
+            topic="cli topic CANARY-e1",
+            script_path="ext/script.txt",
+            material_paths=["ext/clip.mp4"],
+            license_names=["Zlib"],
+            license_evidence=["ref-z"],
+            claims=[],
+            claim_sources=[],
+        )
+        prepare_mock.assert_not_called()
+        self.assertEqual(after - before, set())
+
+        # stdout empty; stderr is byte-exact static message only.
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            stderr.getvalue(),
+            "error: script validation failed\n",
+        )
+
+        # No native text, paths, secrets, Errno, or Traceback leaks.
+        for stream in (stdout.getvalue(), stderr.getvalue()):
+            for leaked in (
+                "CANARY-e1",
+                "ext/script.txt",
+                "/secret/dir",
+                "TOKEN-E9",
+                "clip.mp4",
+                "Zlib",
+                "ref-z",
+                "Traceback",
+                "OSError",
+                "Errno",
+            ):
+                self.assertNotIn(leaked, stream)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -150,6 +150,54 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="URL",
         help="source URL for the matching --claim (repeatable, same order)",
     )
+    render = sub.add_parser(
+        "render-local",
+        help=(
+            "prepare, render locally, and finalize a provenance-bound "
+            "marked output in one offline run"
+        ),
+    )
+    render.add_argument("--topic", required=True, help="task topic")
+    render.add_argument(
+        "--script",
+        required=True,
+        help="local script path",
+    )
+    render.add_argument(
+        "--material",
+        action="append",
+        required=True,
+        metavar="PATH",
+        help="local material path (repeatable, ordered)",
+    )
+    render.add_argument(
+        "--license-name",
+        action="append",
+        required=True,
+        metavar="TEXT",
+        help="license name for the matching --material (repeatable, same order)",
+    )
+    render.add_argument(
+        "--license-evidence",
+        action="append",
+        required=True,
+        metavar="TEXT",
+        help="license evidence for the matching --material (repeatable, same order)",
+    )
+    render.add_argument(
+        "--claim",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="factual claim text (repeatable, optional)",
+    )
+    render.add_argument(
+        "--claim-source",
+        action="append",
+        default=[],
+        metavar="URL",
+        help="source URL for the matching --claim (repeatable, same order)",
+    )
     return parser
 
 
@@ -1314,6 +1362,38 @@ def prepare(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def render_local(args) -> int:
+    """Run the render-local pipeline once from CLI arguments.
+
+    The validator owns all cardinality and content checks; ordered
+    option lists pass through unchanged. On success, print only the
+    task ID and the task-relative manifest and marked-output paths —
+    never script content, licenses, claims, external paths, or native
+    exception text.
+    """
+    finalized = _run_render_local_task(
+        topic=args.topic,
+        script_path=args.script,
+        material_paths=args.material,
+        license_names=args.license_name,
+        license_evidence=args.license_evidence,
+        claims=args.claim,
+        claim_sources=args.claim_source,
+    )
+    task_dir = finalized.verified.draft.staged.task_dir
+    print("BrainTrustCrypto pilot render-local finalized")
+    print(f"  task_id:   {finalized.verified.draft.staged.task_id}")
+    print(
+        f"  manifest:  "
+        f"{os.path.relpath(finalized.manifest_path, task_dir)}"
+    )
+    print(
+        f"  output:    "
+        f"{os.path.relpath(finalized.marked_output_path, task_dir)}"
+    )
+    return EXIT_OK
+
+
 def run(argv=None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -1325,6 +1405,12 @@ def run(argv=None) -> int:
             return EXIT_FAILURE
         except OSError as exc:
             print(f"error: filesystem failure: {exc}", file=sys.stderr)
+            return EXIT_FAILURE
+    if args.command == "render-local":
+        try:
+            return render_local(args)
+        except PrepareError as exc:
+            print(f"error: {exc}", file=sys.stderr)
             return EXIT_FAILURE
     parser.error(f"unknown command: {args.command}")
     return EXIT_USAGE  # unreachable; parser.error exits
