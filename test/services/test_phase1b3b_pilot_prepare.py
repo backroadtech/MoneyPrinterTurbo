@@ -3374,5 +3374,640 @@ class TestBuildRenderLocalVideoParams(_PrepareTestBase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Render-local orchestrator wiring (all stages stubbed)
+# ---------------------------------------------------------------------------
+
+
+class TestRunRenderLocalTaskOrchestration(_PrepareTestBase):
+    """Happy-path order/identity test for _run_render_local_task."""
+
+    def test_run_render_local_task_order_and_identity(self):
+        import app.services as app_services
+
+        order = []
+        calls = {}
+
+        def record(name, result):
+            def stage(*args, **kwargs):
+                order.append(name)
+                calls[name] = (args, kwargs)
+                return result
+
+            return stage
+
+        sentinel_request = object()
+        sentinel_loaded = object()
+        sentinel_staged = unittest.mock.Mock()
+        sentinel_staged.task_id = "staged-task-id-CANARY-o2"
+        sentinel_draft = object()
+        sentinel_params = object()
+        sentinel_task_result = object()
+        sentinel_verified = object()
+        sentinel_finalized = object()
+
+        raw = dict(
+            topic="orch topic CANARY-o1",
+            script_path="src/script.txt",
+            material_paths=["m1", "m2"],
+            license_names=["CC0", "ODbL"],
+            license_evidence=["e1", "e2"],
+            claims=["c1"],
+            claim_sources=["s1"],
+        )
+
+        start_mock = unittest.mock.Mock(
+            side_effect=record("task.start", sentinel_task_result)
+        )
+        fake_task_module = unittest.mock.Mock()
+        fake_task_module.start = start_mock
+
+        before = {
+            name
+            for name in sys.modules
+            if name.startswith("app.services.task")
+        }
+        with patch.object(
+            pilot_prepare,
+            "_validate_render_local_request",
+            side_effect=record("validate", sentinel_request),
+        ) as validate_mock, patch.object(
+            pilot_prepare,
+            "_load_render_local_inputs",
+            side_effect=record("load", sentinel_loaded),
+        ), patch.object(
+            pilot_prepare,
+            "_stage_render_local_task",
+            side_effect=record("stage", sentinel_staged),
+        ), patch.object(
+            pilot_prepare,
+            "_prepare_render_local_draft",
+            side_effect=record("draft", sentinel_draft),
+        ), patch.object(
+            pilot_prepare,
+            "_build_render_local_video_params",
+            side_effect=record("params", sentinel_params),
+        ), patch.object(
+            pilot_prepare,
+            "_verify_render_local_render",
+            side_effect=record("verify", sentinel_verified),
+        ), patch.object(
+            pilot_prepare,
+            "_finalize_render_local_marked_output",
+            side_effect=record("finalize", sentinel_finalized),
+        ), patch.object(
+            app_services, "task", fake_task_module, create=True
+        ):
+            result = pilot_prepare._run_render_local_task(**raw)
+        after = {
+            name
+            for name in sys.modules
+            if name.startswith("app.services.task")
+        }
+
+        # No real renderer module was imported.
+        self.assertEqual(after - before, set())
+
+        # Exact stage order.
+        self.assertEqual(
+            order,
+            [
+                "validate",
+                "load",
+                "stage",
+                "draft",
+                "params",
+                "task.start",
+                "verify",
+                "finalize",
+            ],
+        )
+
+        # Raw arguments forwarded unchanged to the validator.
+        validate_mock.assert_called_once_with(**raw)
+        for key, value in raw.items():
+            self.assertIs(calls["validate"][1][key], value)
+
+        # Each stage result flows by identity into the next stage.
+        self.assertIs(calls["load"][0][0], sentinel_request)
+        self.assertIs(calls["stage"][0][0], sentinel_loaded)
+        self.assertIs(calls["draft"][0][0], sentinel_staged)
+        self.assertIs(calls["params"][0][0], sentinel_draft)
+
+        # task.start receives the exact staged ID, params, and stop_at.
+        start_mock.assert_called_once_with(
+            task_id="staged-task-id-CANARY-o2",
+            params=sentinel_params,
+            stop_at="video",
+        )
+        self.assertIs(calls["task.start"][1]["params"], sentinel_params)
+
+        # Verifier receives the exact draft and task result.
+        self.assertIs(calls["verify"][0][0], sentinel_draft)
+        self.assertIs(calls["verify"][0][1], sentinel_task_result)
+
+        # Finalizer receives the exact verified result.
+        self.assertIs(calls["finalize"][0][0], sentinel_verified)
+
+        # The orchestrator returns the finalized object by identity.
+        self.assertIs(result, sentinel_finalized)
+
+    def test_renderer_exception_preserves_prepared_draft(self):
+        import app.services as app_services
+
+        known_task_id = "12345678-1234-5678-1234-567812345678"
+        src_dir = os.path.join(self.root, "src")
+        os.makedirs(src_dir)
+        script_bytes = b"renderer failure script CANARY-r1.\n"
+        script_src = os.path.join(src_dir, "script.txt")
+        with open(script_src, "wb") as handle:
+            handle.write(script_bytes)
+        material_bytes = b"material-bytes-CANARY-r2"
+        material_src = os.path.join(src_dir, "clip-a.mp4")
+        with open(material_src, "wb") as handle:
+            handle.write(material_bytes)
+
+        start_mock = unittest.mock.Mock(
+            side_effect=OSError("injected renderer failure CANARY-r3")
+        )
+        fake_task_module = unittest.mock.Mock()
+        fake_task_module.start = start_mock
+
+        # Real validation/load/stage/draft/params; only task.start fails.
+        with patch.object(
+            pilot_prepare,
+            "__file__",
+            os.path.join(self.root, "pilot_prepare.py"),
+        ):
+            with patch(
+                "app.utils.utils.get_uuid", return_value=known_task_id
+            ):
+                with patch("shutil.rmtree") as rmtree_mock:
+                    with patch.object(
+                        app_services, "task", fake_task_module,
+                        create=True,
+                    ):
+                        with self.assertRaises(
+                            pilot_prepare.PrepareError
+                        ) as ctx:
+                            pilot_prepare._run_render_local_task(
+                                topic="renderer failure topic",
+                                script_path=script_src,
+                                material_paths=[material_src],
+                                license_names=["CC0"],
+                                license_evidence=["ref-a"],
+                                claims=["claim one"],
+                                claim_sources=["https://example.org/s"],
+                            )
+
+        # Exact static refusal; native failure survives only as the cause.
+        message = str(ctx.exception)
+        self.assertEqual(message, "render-local render failed")
+        self.assertIsInstance(ctx.exception.__cause__, OSError)
+        for leaked in (
+            "CANARY-r3",
+            "injected renderer failure",
+            self.root,
+            script_src,
+            material_src,
+        ):
+            self.assertNotIn(leaked, message)
+
+        # task.start called once with exact task ID, fixed params, stop_at.
+        start_mock.assert_called_once()
+        start_kwargs = start_mock.call_args[1]
+        self.assertEqual(start_kwargs["task_id"], known_task_id)
+        self.assertEqual(start_kwargs["stop_at"], "video")
+        params = start_kwargs["params"]
+        self.assertEqual(params.video_subject, "renderer failure topic")
+        self.assertEqual(
+            params.video_script, script_bytes.decode("utf-8")
+        )
+        self.assertEqual(params.video_source, "local")
+        self.assertEqual(
+            [m.provider for m in params.video_materials], ["local"]
+        )
+        self.assertEqual(params.video_count, 1)
+        self.assertEqual(params.video_aspect, VideoAspect.landscape.value)
+        self.assertEqual(
+            params.video_concat_mode, VideoConcatMode.sequential.value
+        )
+        self.assertEqual(params.video_clip_duration, 5)
+        self.assertEqual(params.voice_name, voice.NO_VOICE_NAME)
+        self.assertFalse(params.subtitle_enabled)
+        self.assertEqual(params.bgm_type, "none")
+
+        # No rollback or recursive deletion after the durable draft.
+        rmtree_mock.assert_not_called()
+
+        # Generated task directory remains with intact prepared evidence.
+        task_dir = os.path.join(
+            self.root, "storage", "tasks", known_task_id
+        )
+        self.assertTrue(os.path.isdir(task_dir))
+        manifest_path = os.path.join(task_dir, "provenance_manifest.json")
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        prov.validate_manifest(manifest)
+        self.assertIsNone(manifest.get("output"))
+        self.assertEqual(
+            manifest["task"]["review_status"], "NEEDS_HUMAN_REVIEW"
+        )
+
+        # script.md and the task-local material/hash remain correct.
+        with open(os.path.join(task_dir, "script.md"), "rb") as handle:
+            self.assertEqual(handle.read(), script_bytes)
+        staged_material = os.path.join(task_dir, "materials", "clip-a.mp4")
+        with open(staged_material, "rb") as handle:
+            staged_material_bytes = handle.read()
+        self.assertEqual(staged_material_bytes, material_bytes)
+        self.assertEqual(
+            hashlib.sha256(staged_material_bytes).hexdigest(),
+            manifest["assets"][0]["sha256"],
+        )
+
+        # External inputs unchanged.
+        with open(script_src, "rb") as handle:
+            self.assertEqual(handle.read(), script_bytes)
+        with open(material_src, "rb") as handle:
+            self.assertEqual(handle.read(), material_bytes)
+
+        # No marked output exists.
+        self.assertFalse(
+            os.path.lexists(
+                os.path.join(
+                    task_dir, prov.marked_filename("final-1.mp4")
+                )
+            )
+        )
+
+    def test_failed_renderer_result_preserves_prepared_draft(self):
+        import app.services as app_services
+
+        known_task_id = "12345678-1234-5678-1234-567812345678"
+        src_dir = os.path.join(self.root, "src")
+        os.makedirs(src_dir)
+        script_bytes = b"failed renderer script CANARY-f1.\n"
+        script_src = os.path.join(src_dir, "script.txt")
+        with open(script_src, "wb") as handle:
+            handle.write(script_bytes)
+        material_bytes = b"material-bytes-CANARY-f2"
+        material_src = os.path.join(src_dir, "clip-a.mp4")
+        with open(material_src, "wb") as handle:
+            handle.write(material_bytes)
+
+        # Established failed-task result shape (task._mark_task_failed).
+        failed_result = {
+            "task_id": known_task_id,
+            "state": const.TASK_STATE_FAILED,
+            "progress": 40,
+            "failed_stage": "pipeline",
+            "error": "renderer exploded CANARY-f3",
+        }
+        start_mock = unittest.mock.Mock(return_value=failed_result)
+        fake_task_module = unittest.mock.Mock()
+        fake_task_module.start = start_mock
+
+        # Real validation/load/stage/draft/params; only task.start patched.
+        with patch.object(
+            pilot_prepare,
+            "__file__",
+            os.path.join(self.root, "pilot_prepare.py"),
+        ):
+            with patch(
+                "app.utils.utils.get_uuid", return_value=known_task_id
+            ):
+                with patch("shutil.rmtree") as rmtree_mock:
+                    with patch.object(
+                        app_services, "task", fake_task_module,
+                        create=True,
+                    ):
+                        with self.assertRaises(
+                            pilot_prepare.PrepareError
+                        ) as ctx:
+                            pilot_prepare._run_render_local_task(
+                                topic="failed renderer topic",
+                                script_path=script_src,
+                                material_paths=[material_src],
+                                license_names=["CC0"],
+                                license_evidence=["ref-a"],
+                                claims=["claim one"],
+                                claim_sources=["https://example.org/s"],
+                            )
+
+        # The existing verifier raises its exact static refusal (proving
+        # the verifier was reached); the finalizer never ran (no marked
+        # output, manifest still output-null). No failure details,
+        # canaries, or paths leak into the message.
+        message = str(ctx.exception)
+        self.assertEqual(
+            message, "render-local task result state is not complete"
+        )
+        self.assertIsNone(ctx.exception.__cause__)
+        for leaked in (
+            "CANARY-f3",
+            "renderer exploded",
+            self.root,
+            script_src,
+            material_src,
+        ):
+            self.assertNotIn(leaked, message)
+
+        # task.start called once with exact task ID, fixed params, stop_at.
+        start_mock.assert_called_once()
+        start_kwargs = start_mock.call_args[1]
+        self.assertEqual(start_kwargs["task_id"], known_task_id)
+        self.assertEqual(start_kwargs["stop_at"], "video")
+        params = start_kwargs["params"]
+        self.assertEqual(params.video_subject, "failed renderer topic")
+        self.assertEqual(
+            params.video_script, script_bytes.decode("utf-8")
+        )
+        self.assertEqual(params.video_source, "local")
+        self.assertEqual(
+            [m.provider for m in params.video_materials], ["local"]
+        )
+        self.assertEqual(params.video_count, 1)
+        self.assertEqual(params.video_aspect, VideoAspect.landscape.value)
+        self.assertEqual(
+            params.video_concat_mode, VideoConcatMode.sequential.value
+        )
+        self.assertEqual(params.video_clip_duration, 5)
+        self.assertEqual(params.voice_name, voice.NO_VOICE_NAME)
+        self.assertFalse(params.subtitle_enabled)
+        self.assertEqual(params.bgm_type, "none")
+
+        # No rollback or recursive deletion after the durable draft.
+        rmtree_mock.assert_not_called()
+
+        # Generated task directory remains with intact prepared evidence.
+        task_dir = os.path.join(
+            self.root, "storage", "tasks", known_task_id
+        )
+        self.assertTrue(os.path.isdir(task_dir))
+        manifest_path = os.path.join(task_dir, "provenance_manifest.json")
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        prov.validate_manifest(manifest)
+        self.assertIsNone(manifest.get("output"))
+        self.assertEqual(
+            manifest["task"]["review_status"], "NEEDS_HUMAN_REVIEW"
+        )
+
+        # script.md and the task-local material/hash remain correct.
+        with open(os.path.join(task_dir, "script.md"), "rb") as handle:
+            self.assertEqual(handle.read(), script_bytes)
+        staged_material = os.path.join(task_dir, "materials", "clip-a.mp4")
+        with open(staged_material, "rb") as handle:
+            staged_material_bytes = handle.read()
+        self.assertEqual(staged_material_bytes, material_bytes)
+        self.assertEqual(
+            hashlib.sha256(staged_material_bytes).hexdigest(),
+            manifest["assets"][0]["sha256"],
+        )
+
+        # External inputs unchanged.
+        with open(script_src, "rb") as handle:
+            self.assertEqual(handle.read(), script_bytes)
+        with open(material_src, "rb") as handle:
+            self.assertEqual(handle.read(), material_bytes)
+
+        # No marked output exists.
+        self.assertFalse(
+            os.path.lexists(
+                os.path.join(
+                    task_dir, prov.marked_filename("final-1.mp4")
+                )
+            )
+        )
+
+    def test_successful_fake_renderer_completes_provenance(self):
+        import app.services as app_services
+
+        known_task_id = "12345678-1234-5678-1234-567812345678"
+        src_dir = os.path.join(self.root, "src")
+        os.makedirs(src_dir)
+        script_bytes = b"successful orchestration script CANARY-g1.\n"
+        script_src = os.path.join(src_dir, "script.txt")
+        with open(script_src, "wb") as handle:
+            handle.write(script_bytes)
+        material_bytes = b"material-bytes-CANARY-g2"
+        material_src = os.path.join(src_dir, "clip-a.mp4")
+        with open(material_src, "wb") as handle:
+            handle.write(material_bytes)
+        output_bytes = b"fake-rendered-video-CANARY-g3\x00\xff"
+
+        captured = {}
+
+        def fake_start(task_id, params, stop_at):
+            # Exact task ID, fixed params, and stop_at arrive unchanged.
+            self.assertEqual(task_id, known_task_id)
+            self.assertEqual(stop_at, "video")
+            task_dir = os.path.join(
+                self.root, "storage", "tasks", task_id
+            )
+            self.assertEqual(
+                params.video_subject, "successful orchestration topic"
+            )
+            self.assertEqual(
+                params.video_script, script_bytes.decode("utf-8")
+            )
+            self.assertEqual(params.video_source, "local")
+            self.assertEqual(
+                [m.provider for m in params.video_materials], ["local"]
+            )
+            self.assertEqual(
+                [m.url for m in params.video_materials],
+                [os.path.join("materials", "clip-a.mp4")],
+            )
+            self.assertEqual(params.video_count, 1)
+            self.assertEqual(
+                params.video_aspect, VideoAspect.landscape.value
+            )
+            self.assertEqual(
+                params.video_concat_mode, VideoConcatMode.sequential.value
+            )
+            self.assertEqual(params.video_clip_duration, 5)
+            self.assertEqual(params.voice_name, voice.NO_VOICE_NAME)
+            self.assertFalse(params.subtitle_enabled)
+            self.assertEqual(params.bgm_type, "none")
+
+            # Capture the prepared output-null draft before mutation.
+            with open(
+                os.path.join(task_dir, "provenance_manifest.json"),
+                encoding="utf-8",
+            ) as handle:
+                captured["draft_manifest"] = json.load(handle)
+
+            # Fixture-shaped script.json built from the received params.
+            script_json = {
+                "script": params.video_script,
+                "params": {
+                    "video_script": params.video_script,
+                    "video_source": params.video_source,
+                    "video_count": params.video_count,
+                    "video_aspect": params.video_aspect,
+                    "video_concat_mode": params.video_concat_mode,
+                    "video_clip_duration": params.video_clip_duration,
+                    "voice_name": params.voice_name,
+                    "subtitle_enabled": params.subtitle_enabled,
+                    "bgm_type": params.bgm_type,
+                    "video_materials": [
+                        {"provider": m.provider, "url": m.url}
+                        for m in params.video_materials
+                    ],
+                },
+            }
+            with open(
+                os.path.join(task_dir, "script.json"), "w",
+                encoding="utf-8",
+            ) as handle:
+                json.dump(script_json, handle)
+            with open(
+                os.path.join(task_dir, "final-1.mp4"), "wb"
+            ) as handle:
+                handle.write(output_bytes)
+            return {
+                "task_id": task_id,
+                "state": const.TASK_STATE_COMPLETE,
+                "progress": 100,
+                "videos": ["final-1.mp4"],
+            }
+
+        fake_task_module = unittest.mock.Mock()
+        fake_task_module.start = fake_start
+
+        forbidden = ("app.services.task", "app.services.upload_post")
+        before = {
+            name for name in sys.modules if name.startswith(forbidden)
+        }
+        with patch.object(
+            pilot_prepare,
+            "__file__",
+            os.path.join(self.root, "pilot_prepare.py"),
+        ):
+            with patch(
+                "app.utils.utils.get_uuid", return_value=known_task_id
+            ):
+                with patch.object(
+                    app_services, "task", fake_task_module, create=True
+                ):
+                    finalized = pilot_prepare._run_render_local_task(
+                        topic="successful orchestration topic",
+                        script_path=script_src,
+                        material_paths=[material_src],
+                        license_names=["CC0"],
+                        license_evidence=["ref-a"],
+                        claims=[
+                            "Bitcoin supply is capped at 21 million."
+                        ],
+                        claim_sources=["https://bitcoin.org/bitcoin.pdf"],
+                    )
+        after = {
+            name for name in sys.modules if name.startswith(forbidden)
+        }
+
+        # No real renderer or upload module was imported.
+        self.assertEqual(after - before, set())
+
+        task_dir = os.path.join(
+            self.root, "storage", "tasks", known_task_id
+        )
+        marked_name = prov.marked_filename("final-1.mp4")
+
+        # Returned finalized structure.
+        self.assertIsInstance(
+            finalized, pilot_prepare.RenderLocalFinalizedRender
+        )
+        self.assertEqual(
+            finalized.verified.draft.staged.task_id, known_task_id
+        )
+        self.assertEqual(
+            os.path.basename(finalized.marked_output_path), marked_name
+        )
+        self.assertEqual(
+            os.path.dirname(finalized.marked_output_path), task_dir
+        )
+        self.assertEqual(
+            finalized.manifest_path,
+            os.path.join(task_dir, "provenance_manifest.json"),
+        )
+
+        # Original and marked output bytes/hash match.
+        with open(
+            os.path.join(task_dir, "final-1.mp4"), "rb"
+        ) as handle:
+            self.assertEqual(handle.read(), output_bytes)
+        with open(finalized.marked_output_path, "rb") as handle:
+            self.assertEqual(handle.read(), output_bytes)
+        self.assertEqual(
+            finalized.marked_output_sha256,
+            hashlib.sha256(output_bytes).hexdigest(),
+        )
+        self.assertEqual(
+            finalized.marked_output_sha256,
+            finalized.verified.output_sha256,
+        )
+
+        # Durable manifest validates with the marked output recorded.
+        prov.validate_manifest(finalized.manifest)
+        with open(finalized.manifest_path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), finalized.manifest)
+        output = finalized.manifest["output"]
+        self.assertEqual(output["local_path"], marked_name)
+        self.assertEqual(
+            output["sha256"], finalized.verified.output_sha256
+        )
+        self.assertEqual(output["filename_marker"], marked_name)
+        self.assertFalse(output["visible_watermark_required"])
+
+        # NEEDS_HUMAN_REVIEW preserved everywhere.
+        self.assertEqual(output["review_status"], "NEEDS_HUMAN_REVIEW")
+        self.assertEqual(
+            finalized.manifest["task"]["review_status"],
+            "NEEDS_HUMAN_REVIEW",
+        )
+
+        # Prepared sections survive finalization verbatim.
+        draft_manifest = captured["draft_manifest"]
+        for section in (
+            "task", "script", "assets", "factual_claims", "ai_generations"
+        ):
+            self.assertEqual(
+                finalized.manifest[section], draft_manifest[section]
+            )
+
+        # Task-local script/material/license/claim evidence is correct.
+        self.assertEqual(
+            draft_manifest["script"]["sha256"],
+            hashlib.sha256(script_bytes).hexdigest(),
+        )
+        self.assertEqual(
+            draft_manifest["assets"][0]["sha256"],
+            hashlib.sha256(material_bytes).hexdigest(),
+        )
+        assets_json = json.dumps(draft_manifest["assets"])
+        self.assertIn("CC0", assets_json)
+        self.assertIn("ref-a", assets_json)
+        claims_json = json.dumps(draft_manifest["factual_claims"])
+        self.assertIn(
+            "Bitcoin supply is capped at 21 million.", claims_json
+        )
+        self.assertIn("https://bitcoin.org/bitcoin.pdf", claims_json)
+
+        # External inputs unchanged.
+        with open(script_src, "rb") as handle:
+            self.assertEqual(handle.read(), script_bytes)
+        with open(material_src, "rb") as handle:
+            self.assertEqual(handle.read(), material_bytes)
+
+        # pilot_review status/audit assembly accepts the task.
+        state = pilot_review._assemble_state(task_dir)
+        self.assertEqual(state.get("failures"), [])
+        self.assertEqual(state.get("script_status"), "ok")
+        self.assertEqual(state.get("asset_statuses"), ["ok"])
+        self.assertEqual(state.get("output_status"), "ok")
+
+
 if __name__ == "__main__":
     unittest.main()

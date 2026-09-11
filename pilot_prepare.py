@@ -1105,6 +1105,58 @@ def _finalize_render_local_marked_output(
     )
 
 
+def _run_render_local_task(
+    topic: str,
+    script_path: str,
+    material_paths: list[str] | tuple[str, ...],
+    license_names: list[str] | tuple[str, ...],
+    license_evidence: list[str] | tuple[str, ...],
+    claims: list[str] | tuple[str, ...] | None = None,
+    claim_sources: list[str] | tuple[str, ...] | None = None,
+) -> RenderLocalFinalizedRender:
+    """Run the render-local pipeline end to end, internally.
+
+    Validates the raw request (the pilot policy gate runs first),
+    loads, stages, and prepares the durable draft, then builds the
+    fixed render parameters. The renderer is imported lazily only
+    after the durable draft exists, and task.start runs with the exact
+    staged task ID and the exact built params at stop_at="video". Any
+    escaped renderer exception surfaces as a static sanitized
+    PrepareError with the native exception chained only as the cause;
+    a failed or incomplete returned result flows through the existing
+    verifier unchanged. Once the durable draft exists it is never
+    rolled back for renderer, verification, or finalization failure.
+    No validation or schema logic is duplicated here.
+    """
+    request = _validate_render_local_request(
+        topic=topic,
+        script_path=script_path,
+        material_paths=material_paths,
+        license_names=license_names,
+        license_evidence=license_evidence,
+        claims=claims,
+        claim_sources=claim_sources,
+    )
+    loaded = _load_render_local_inputs(request)
+    staged = _stage_render_local_task(loaded)
+    draft = _prepare_render_local_draft(staged)
+    params = _build_render_local_video_params(draft)
+
+    from app.services import task
+
+    try:
+        task_result = task.start(
+            task_id=staged.task_id,
+            params=params,
+            stop_at="video",
+        )
+    except Exception as exc:
+        raise PrepareError("render-local render failed") from exc
+
+    verified = _verify_render_local_render(draft, task_result)
+    return _finalize_render_local_marked_output(verified)
+
+
 def _resolve_and_confine(task_dir: str, raw_path: str, *, must_exist: bool,
                          description: str) -> str:
     """Resolve raw_path inside task_dir with provenance confinement rules."""
