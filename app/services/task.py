@@ -650,8 +650,15 @@ def get_video_materials(
 ):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
+        # 只允许本任务自己的 materials 目录作为额外受信根；这里仅做词法上的
+        # 归一化，不创建、不检查、不写入该目录。
+        task_materials_root = os.path.realpath(
+            os.path.join(utils.storage_dir(), "tasks", task_id, "materials")
+        )
         materials = video.preprocess_video(
-            materials=params.video_materials, clip_duration=params.video_clip_duration
+            materials=params.video_materials,
+            clip_duration=params.video_clip_duration,
+            extra_allowed_roots=(task_materials_root,),
         )
         if not materials:
             _mark_task_failed(
