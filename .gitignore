@@ -42,3 +42,15 @@ htmlcov/
 .codegraph
 /docs/superpowers
 .understand-anything
+
+# BrainTrustCrypto hardening: secrets and credentials
+/secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# BrainTrustCrypto hardening: generated output and quarantine
+/storage/braintrustcrypto_output/
+/quarantine/
+/hardening.toml

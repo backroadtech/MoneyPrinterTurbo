@@ -683,8 +683,19 @@ def build_video_params(args: argparse.Namespace) -> VideoParams:
     # 避免执行 ``cli.py -h`` 时产生配置初始化日志。
     from app.config import config
     from app.models.schema import MaterialInfo, VideoParams
+    from app.services.pilot_policy import get_pilot_policy
 
     ui_config = config.ui
+
+    # BrainTrustCrypto pilot mode gates BGM and font selection
+    _policy = get_pilot_policy()
+    if _policy is not None:
+        _policy.require_bgm_source_allowed(
+            bgm_type=args.bgm_type or "",
+            bgm_file=args.bgm_file or "",
+        )
+        if args.font_name:
+            _policy.require_font_allowed(args.font_name)
 
     video_terms = args.video_terms
     if video_terms:

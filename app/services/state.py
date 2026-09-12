@@ -229,7 +229,15 @@ class RedisState(BaseState):
 
 
 # Global state
+from app.services.pilot_policy import get_pilot_policy
+
 _enable_redis = config.app.get("enable_redis", False)
+
+# BrainTrustCrypto pilot mode prohibits Redis
+_pilot = get_pilot_policy()
+if _pilot is not None and _enable_redis:
+    _pilot.require_not_redis()
+
 _redis_host = config.app.get("redis_host", "localhost")
 _redis_port = config.app.get("redis_port", 6379)
 _redis_db = config.app.get("redis_db", 0)

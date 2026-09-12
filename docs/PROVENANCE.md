@@ -1,0 +1,402 @@
+# Provenance Manifest — Phase 1B.3A / 1B.3C.2A / 1B.3C.2B.2B / 1B.3C.2B.2C
+
+Offline provenance and human-review manifest foundation for BrainTrustCrypto
+pilot tasks.
+
+**Status:** foundation plus offline review-integrity primitives, schema
+1.2.0 claim IDs with transaction journal (Phase 1B.3C.2B.2B), and crash-safe
+claim-transaction commands with deterministic resume (Phase 1B.3C.2B.2C).
+This module is **not** integrated with rendering, providers, or publishing.
+
+## Purpose
+
+Every pilot task produces a `provenance_manifest.json` inside its task
+directory. The manifest records where the script, assets, factual claims, AI
+generations, and final output came from, and forces every task through a
+human-review gate before anything may be rendered or published.
+
+## Module
+
+`app/services/provenance.py` — standard library only. No network calls.
+
+Machine-readable schema: `docs/provenance-manifest-schema.json`
+(JSON Schema draft 2020-12).
+
+## Manifest sections
+
+### 1. Task
+| Field | Notes |
+|---|---|
+| `schema_version` | `"1.2.0"` for new manifests; `"1.0.0"` and `"1.1.0"` manifests remain valid for read/validate and explicit migration only |
+| `task_id` | Non-empty string |
+| `created_at` | UTC ISO-8601 timestamp (offset required) |
+| `topic` | Non-empty string |
+| `pilot_profile` | e.g. `braintrustcrypto` |
+| `review_status` | `NEEDS_HUMAN_REVIEW` (default), `APPROVED`, or `REJECTED` |
+
+### 2. Script
+`local_path` (relative to task dir), `sha256` (streamed), `generation_source`,
+optional `ai_provider` / `ai_model`, and `prompt_hash` — **only the SHA-256 of
+the prompt; the full sensitive prompt is never stored.**
+
+### 3. Assets
+Each asset records: `asset_type` (`video`/`audio`/`image`/`text`/`subtitle`/
+`other`), `source_type` (`local`/`provider`/`ai_generated`), `source_url`,
+`provider`, `provider_asset_id`, `retrieval_date`, `local_path`, `sha256`,
+`license_name`, `license_evidence`, `notes`.
+
+Rules enforced by `build_asset()`:
+- **local** — `source_url` may be omitted; **license evidence is always
+  required** (for every asset).
+- **provider** — `source_url`, `retrieval_date`, `provider`,
+  `provider_asset_id`, and license information are all required.
+- **ai_generated** — `provider` (the AI provider) is required; `source_url`
+  may be omitted.
+
+### 4. Factual claims
+`claim_id`, `claim_text`, `source_url`, optional `source_publication_date` and
+`retrieval_date`, and `status`: `UNVERIFIED` (default), `VERIFIED`, or
+`RETRACTED`.
+
+Schema 1.2.0 adds the required `claim_id` field: an immutable, deterministic
+identifier derived from SHA-256 of canonical JSON containing `task_id`,
+zero-based original `ordinal`, normalized `claim_text` (NFC, CRLF→LF,
+trimmed), and `source_url` exactly as stored. Format: `claim-` + 32 lowercase
+hex chars (first 128 bits of SHA-256).
+
+**Claim-ID contract:**
+- `build_manifest()` does **not** silently generate a missing `claim_id`.
+- A schema 1.2.0 claim without `claim_id` fails validation/building.
+- Claim IDs may be generated only by:
+  - `pilot_prepare.py` for new prepared tasks
+  - `migrate_manifest_to_1_2_0()` (explicit pure migration)
+  - an explicit caller using `generate_claim_id()`
+- Schema 1.0.0 and 1.1.0 claims remain valid without `claim_id`.
+
+Accountability (schema 1.0.0 legacy path): a `VERIFIED` or `RETRACTED` claim
+must name a `reviewer` and a `review_date`.
+
+Schema 1.1.0 adds optional fields: `supporting_sources` (list of URLs),
+`reviewer_id`, `reviewer_display_name`, `review_timestamp_utc`, and `notes`.
+
+Reviewer identity rules (1.1.0):
+- `reviewer_id` — lowercase only, 1–64 characters,
+  `[a-z0-9][a-z0-9._-]{0,63}`.
+- `reviewer_display_name` — 1–128 characters, control characters rejected.
+  Manually supplied during the pilot; no authentication or credentials yet.
+
+Supporting-source rules (1.1.0):
+- A `VERIFIED` claim requires **at least one valid supporting HTTPS URL**.
+  The existing `source_url` may satisfy this; `supporting_sources` entries
+  are optional extras.
+- A `RETRACTED` claim using the 1.1.0 identity fields requires
+  `reviewer_id`, `reviewer_display_name`, `review_timestamp_utc`, and
+  explanatory `notes`.
+- Active `UNVERIFIED` and `RETRACTED` claims **block task approval**
+  (`assert_no_blocking_claims()`).
+
+### 5. AI generations
+`provider`, `model`, `generation_timestamp` (UTC), `output_type`
+(`text`/`image`/`audio`/`video`/`script`/`other`), `prompt_hash`, and
+`parameters` — non-secret parameters only. Keys or values that look like
+credentials (API keys, tokens, authorization headers, cookies, passwords,
+private keys) or full prompts are rejected.
+
+### 6. Output
+`local_path`, `sha256` (when the file exists), `review_status`,
+`filename_marker`, and `visible_watermark_required` (always `false`).
+
+Schema 1.1.0 output `review_status` values: `NEEDS_HUMAN_REVIEW`,
+`APPROVED`, `REJECTED`, `SUPERSEDED`. **`REVOKED` is intentionally not a
+value** — revocation is recorded via an immutable receipt, never by
+mutating `output.review_status`.
+
+While unreviewed, the output filename carries the marker
+`__NEEDS_HUMAN_REVIEW` before its extension
+(`final__NEEDS_HUMAN_REVIEW.mp4`). The marker is removed on a terminal
+human decision. **No visible watermark is required** — the marker lives in
+the filename only.
+
+## Schema 1.2.0 and migration
+
+- New manifests are built with `schema_version = "1.2.0"`.
+- Existing `1.0.0` and `1.1.0` manifests remain valid: `validate_manifest()`
+  accepts all supported versions and applies the legacy rules to 1.0.0/1.1.0
+  documents.
+- `migrate_manifest_to_1_2_0()` performs an **explicit, additive-only**
+  migration from 1.0.0 or 1.1.0 to 1.2.0: it validates the source manifest,
+  deep-copies it, generates deterministic `claim_id` for every claim, sets
+  `schema_version` to `1.2.0`, and re-validates. The input dict is **never
+  mutated**. APPROVED and REJECTED manifests are rejected.
+- `migrate_manifest_1_0_0_to_1_1_0()` performs an **explicit, additive-only**
+  migration from 1.0.0 to 1.1.0: it validates the 1.0.0 manifest, deep-copies
+  it, sets `schema_version` to `1.1.0`, initializes the new claim fields to
+  `null`, and re-validates. The input dict is **never mutated**. APPROVED and
+  REJECTED manifests are rejected.
+- A 1.0.0 or 1.1.0 manifest is **never silently reinterpreted or overwritten
+  in place**.
+
+## Canonical JSON for hashes
+
+Audit events, receipts, and manifest snapshots are hashed over canonical
+UTF-8 JSON bytes with these exact rules:
+
+- `sort_keys=True`
+- `separators=(",", ":")` (compact)
+- `ensure_ascii=False`
+- `allow_nan=False`
+- no trailing whitespace; the hashed bytes have **no trailing newline**
+- **floating-point values are rejected** in any structure that is hashed
+  (cross-platform float serialization would break hash stability)
+
+`provenance.canonical_json_bytes()` and `provenance.canonical_sha256()`
+implement these rules; serialization is deterministic across repeated calls.
+
+## Review-integrity primitives (Phase 1B.3C.2A)
+
+`app/services/review_integrity.py` — standard library only, fully offline.
+Standalone primitives confined to the task directory:
+
+- `manifest-history/000001_<manifest-sha256>.json` — immutable manifest
+  snapshots; never overwritten; verified against the hash in the filename.
+- `review-events/000001_<event-id>.json` — sequential, hash-chained audit
+  events. Each event carries `schema_version`, `sequence`, `event_id`,
+  `event_type`, `timestamp_utc`, `reviewer_id`, `reviewer_display_name`,
+  `reason` (when required), `previous_event_hash`, `manifest_hash_before`,
+  `manifest_hash_after`, `details`, and `event_hash`. The chain fails closed
+  on missing, reordered, duplicated, malformed, or modified events.
+- `approvals/000001_<receipt-id>.json` — sequential, hash-chained
+  APPROVAL/REVOCATION receipts. A REVOCATION must reference the
+  `receipt_id` and `receipt_hash` of the APPROVAL it revokes; double
+  revocation is rejected. Receipts are canonical, immutable, atomically
+  created, and never overwritten.
+- `review.lock` — task-local exclusive lock (`lock_token`, `process_id`,
+  `hostname`, `created_at_utc`, reviewer identity). Acquisition fails closed
+  when a lock exists or is malformed; release requires the matching token;
+  **age alone is never treated as abandonment**. Explicit recovery
+  (`recover_review_lock()`) requires reviewer identity and a reason, removes
+  the lock, and records a `LOCK_RECOVERED` audit event — including whether
+  the original lock was malformed (captured **before** removal).
+
+All creation is atomic: same-directory temporary file, flush + fsync, then
+exclusive finalization; temporary files are cleaned up after failure, and
+the last valid state is preserved. All paths are confined to the task
+directory (traversal, unsafe absolute paths, symlink escapes, and junction
+escapes are rejected where testable).
+
+### Chain-head checkpoints
+
+Each chain (`review-events/`, `approvals/`) maintains an atomically updated
+`chain-head.json` checkpoint recording `schema_version`, `chain_type`,
+`last_sequence`, `last_record_id`, `last_record_hash`, and a canonical
+`checkpoint_hash`. The checkpoint is an index, not an immutable review
+event. **Empty-chain rule:** an empty chain has no checkpoint file.
+
+Validation fails closed when the checkpoint is missing on a nonempty chain,
+malformed, hash-invalid, points at a missing or mismatched final record,
+when records exist beyond the checkpoint (an uncommitted tail from an
+interrupted append), or when the checkpoint sequence disagrees with the
+records. Write ordering is: create the immutable record, fsync, then
+atomically update the checkpoint. An interruption between those steps
+leaves an uncommitted tail that fails closed and requires explicit
+low-level recovery (`discard_uncommitted_tail()`), which needs reviewer
+identity and a reason and preserves audit evidence.
+
+**Security limitation.** Chain-head checkpoints detect accidental deletion,
+truncation, corruption, and ordinary manual modification. Without digital
+signatures or an external trusted anchor, a fully capable local attacker
+could roll back both the chain and its checkpoint together. Digital
+signatures and external anchoring are deferred; **no cryptographic
+tamper-proofing is claimed.**
+
+### Split event/checkpoint primitives (Phase 1B.3C.2B.2B)
+
+Event-file creation and checkpoint advancement are separately controlled
+primitives:
+
+- `create_review_event_file(...)` validates the committed chain and creates
+  only the immutable next event file (exclusive create, fsync, never
+  overwritten). It never advances the checkpoint: the new event is an
+  uncommitted tail that fails closed on committed-chain validation and
+  blocks further event-file creation until it is committed.
+- `advance_review_event_checkpoint(task_dir, *, sequence, event_id,
+  event_hash)` commits exactly one expected tail. Before any checkpoint
+  write it fully validates the existing checkpoint (structure and
+  self-hash), the complete committed event prefix, and the candidate
+  tail's full event structure and semantics, and requires the referenced
+  event to be the sole next-sequence tail beyond the checkpoint. Only
+  then is the checkpoint atomically advanced, and the resulting committed
+  chain is fully validated again. A rejected advance never mutates the
+  checkpoint; event files are never created, modified, rewritten, or
+  deleted.
+- `create_review_event(...)` keeps its pre-split signature and observable
+  behavior by composing the two primitives: create the immutable event
+  file, then advance the checkpoint to it.
+
+Read-only `status` and `audit` CLI commands are available (Phase
+1B.3C.2B.1). The mutating claim-transaction commands `verify-claim`,
+`retract-claim`, and `resume-transaction` are available (Phase
+1B.3C.2B.2C); approval, rejection, revocation, lock recovery, tail
+recovery, and publishing remain outside the exposed CLI scope.
+
+## Transaction journal (Phase 1B.3C.2B.2B)
+
+`review-transaction.json` — an atomic, hash-verified journal for multi-step
+review transactions (verify-claim, retract-claim). The journal records
+exactly these 18 fields: `schema_version`, `transaction_id`, `operation`,
+`task_id`, `claim_id`, `starting_manifest_hash`, `proposed_manifest_hash`,
+`proposed_manifest_relative_path`, `snapshot_relative_path`,
+`expected_event_id`, `expected_event_hash`, `lock_token`,
+`transaction_stage`, `created_at_utc`, `original_reviewer_id`,
+`original_reviewer_display_name`, `claim_notes`, and `journal_hash`.
+Missing or unknown fields fail closed.
+
+`claim_notes` is a required, nullable string: the exact sanitized
+`--notes` value of a verify-claim transaction, the exact sanitized
+`--reason` value of a retract-claim transaction, or `null`. It is covered
+by `journal_hash` and, like every field except `transaction_stage`, is
+immutable across stage advances. At resume load, a non-null `claim_notes`
+is re-checked against the current secret patterns after structural and
+self-hash validation and before any use; a violation fails closed
+`TRANSACTION_JOURNAL_CORRUPT` before any write (`null` carries no content
+and is skipped). The value is never printed on any output surface or in
+any error message and is never included in recovery receipts.
+
+Stages (exactly eight, forward-only):
+
+```
+INITIATED → LOCK_ACQUIRED → SNAPSHOT_CREATED → PROPOSED_MANIFEST_READY →
+EVENT_CREATED → CHECKPOINT_UPDATED → MANIFEST_INSTALLED → COMMITTED
+```
+
+Rules:
+- Creation is atomic and exclusive; an existing journal blocks creation.
+- Stage updates advance only to the immediately following stage; skips,
+  repeats, and reversals are rejected.
+- Only `transaction_stage` (and the derived `journal_hash`) may change
+  through the update primitive; every other field is immutable.
+- A malformed or hash-mismatched journal fails closed on read.
+- `status` always reports transaction status: `transaction status: none`
+  when no journal exists. When any journal exists — valid or malformed —
+  `status` prints only `transaction status: INCOMPLETE_TRANSACTION`, a
+  sanitized `transaction id` (or `invalid`), and a validated known
+  `transaction stage` (or `invalid`), then exits 1. Operation, claim IDs,
+  reasons, tokens, and parser details are never printed.
+- `audit` reports reason code `INCOMPLETE_TRANSACTION` and exits 1 without
+  exposing journal contents.
+- `status` and `audit` remain byte-for-byte read-only; they never create,
+  modify, or delete the journal.
+
+## Claim-transaction commands and resume (Phase 1B.3C.2B.2C)
+
+`pilot_review.py` exposes five offline review commands, all confined to
+the task directory: `status`, `audit`, `verify-claim`, `retract-claim`,
+and `resume-transaction`. `status` and `audit` remain strictly read-only.
+
+`verify-claim` promotes one `UNVERIFIED` claim to `VERIFIED`
+(`--claim-id`, `--reviewer-id`, `--reviewer-display-name`, optional
+`--notes`). `retract-claim` marks one claim `RETRACTED` (mandatory
+`--reason`). Both execute one forward-only transaction across the eight
+journal stages: acquire the task lock, snapshot the starting manifest
+into `manifest-history/`, write the deterministic proposed manifest,
+create the planned `CLAIM_VERIFIED` or `CLAIM_RETRACTED` review event,
+advance the chain-head checkpoint, install the proposed manifest, and
+commit. The transaction reaches COMMITTED before final cleanup. Direct
+completion reconciles the lock before deleting the journal. Resume
+finalization reconciles the lock, creates or verifies the recovery
+receipt, and deletes the transaction journal last. An interruption
+leaves a legitimate journal at exactly one stage; `status` and `audit`
+then report `INCOMPLETE_TRANSACTION`, and further
+`verify-claim`/`retract-claim` commands refuse until the transaction is
+explicitly resumed. Completing a claim transaction never changes
+`review_status` and never approves anything: the task stays
+`NEEDS_HUMAN_REVIEW` until a separate human decision.
+
+`resume-transaction` (`--transaction-id`, `--reviewer-id`,
+`--reviewer-display-name`, `--reason`) is the only way forward. It writes
+nothing until every check passes, validating in order: the active
+manifest; journal presence and validity; the transaction-id argument
+shape and journal match; the resuming reviewer ID; the resuming reviewer
+display name; the reason; the pilot policy gate; the `claim_notes`
+secret re-check; and recorded-operation and immutable journal-identity
+consistency with the active manifest. Resume then continues strictly
+forward from the recorded stage — stages are never skipped, repeated, or
+reversed:
+
+- **Absent proposed-manifest temporary file** — the deterministic
+  proposed manifest is rebuilt from journal fields alone and proven
+  against the journal's `proposed_manifest_hash` before anything is
+  written.
+- **Exact valid temporary file** — reused byte-for-byte without
+  rewriting.
+- **Mismatched or ambiguous evidence** — including a durable proposed
+  manifest whose target-claim `notes` differ from the journal
+  `claim_notes` — fails closed `TRANSACTION_AMBIGUOUS`; the temporary
+  file is never deleted and never overwritten.
+
+The original transaction reviewer identity and timestamps are preserved:
+the installed claim and the committed review event carry the original
+reviewer and the original transaction timestamps, never the resuming
+reviewer or the resume time. The resuming reviewer and the new resume
+reason appear in exactly one place: an immutable recovery receipt at
+`review-recovery/transaction-resumed-<transaction_id>.json`. Receipt
+creation is create-or-verify — an existing receipt with exactly the
+expected content is verified, never rewritten. The transaction journal is
+deleted last, only after the receipt exists and validates.
+
+Before COMMITTED, resume requires the matching journal-recorded lock; a
+missing, foreign-token, or malformed lock fails closed without writes.
+At COMMITTED finalization, a matching lock is released and its absence
+verified, while an already-absent lock is accepted as previously
+reconciled. A foreign-token or malformed COMMITTED lock still fails
+closed. Recovery-receipt creation or verification follows lock
+reconciliation, and the transaction journal is deleted last only after
+the receipt exists and validates. Every command output and error
+message is static and sanitized:
+no `claim_notes` values, reasons, lock tokens, absolute paths, native
+exception text, or parser details ever appear on any surface.
+
+## Review states and transitions
+
+```
+NEEDS_HUMAN_REVIEW ──► APPROVED   (terminal)
+                  ──► REJECTED   (terminal)
+```
+
+- Every new manifest defaults to `NEEDS_HUMAN_REVIEW`.
+- `APPROVED` and `REJECTED` are terminal; no further transitions.
+- Approving is rejected while any factual claim remains `UNVERIFIED`
+  (schema 1.1.0: `UNVERIFIED` or `RETRACTED`).
+- Any transition not listed above is rejected
+  (`transition_review_status()`).
+
+## Security and integrity guarantees
+
+- **Fail closed:** every manifest starts at `NEEDS_HUMAN_REVIEW`.
+- **Standard library only.**
+- **Streaming SHA-256:** files are hashed in 1 MiB chunks; large media is
+  never fully loaded into memory.
+- **Path confinement:** all local paths must resolve inside the designated
+  task directory. Traversal (`../`), symlink escapes, and unsafe absolute
+  paths (including other Windows drives) are rejected.
+- **Atomic writes:** manifests are written to a same-directory temporary
+  file, fsynced, then atomically renamed (`os.replace`). The temporary file
+  is removed on any failure.
+- **Deterministic JSON:** stable top-level field ordering, sorted keys,
+  fixed separators, UTF-8, trailing newline — identical manifests produce
+  byte-identical files.
+- **Secret hygiene:** API keys, authorization headers, cookies, tokens,
+  passwords, private keys, and full sensitive prompts are never recorded.
+  Only prompt hashes are stored. Suspicious keys/values raise
+  `ProvenanceError`.
+- **Validation:** required fields and closed enum values are validated at
+  build time and again before every write.
+
+## Tests
+
+`test/services/test_phase1b3a_provenance.py` — fully offline (no network).
+Covers deterministic output, large-file streaming hashes, path traversal and
+unsafe absolute paths, atomic writes and temp-file cleanup, missing fields
+and invalid enums, local/provider/AI-generated asset rules, claim-review
+requirements, secret redaction/rejection, and `NEEDS_HUMAN_REVIEW` defaults
+plus the filename marker.

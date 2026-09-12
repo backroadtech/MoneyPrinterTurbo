@@ -2193,5 +2193,60 @@ class TestTaskService(unittest.TestCase):
         print(result)
 
 
+class TestGetVideoMaterialsLocalRoot(unittest.TestCase):
+    """get_video_materials forwards exactly the owning task's materials root.
+
+    Mocked boundaries only: no filesystem mutation, network, or
+    rendering; non-local branches keep their existing behavior.
+    """
+
+    def test_local_branch_forwards_single_task_materials_root(self):
+        supplied = [
+            MaterialInfo(provider="local", url="a.mp4"),
+            MaterialInfo(provider="local", url="b.mp4"),
+        ]
+        params = VideoParams(
+            video_subject="x",
+            video_source="local",
+            video_materials=supplied,
+            video_clip_duration=7,
+        )
+        returned = [
+            MaterialInfo(provider="local", url="C:\\resolved\\b.mp4"),
+            MaterialInfo(provider="local", url="C:\\resolved\\a.mp4"),
+        ]
+        with patch.object(
+            tm.video, "preprocess_video", return_value=returned
+        ) as prep:
+            result = tm.get_video_materials("task-root-1", params, ["term"], 12)
+
+        expected_root = os.path.realpath(
+            os.path.join(
+                utils.storage_dir(), "tasks", "task-root-1", "materials"
+            )
+        )
+        prep.assert_called_once_with(
+            materials=supplied,
+            clip_duration=7,
+            extra_allowed_roots=(expected_root,),
+        )
+        self.assertEqual(result, ["C:\\resolved\\b.mp4", "C:\\resolved\\a.mp4"])
+        self.assertFalse(os.path.exists(expected_root))
+
+    def test_download_branch_does_not_pass_extra_roots(self):
+        params = VideoParams(video_subject="x", video_source="pexels")
+        with (
+            patch.object(tm.video, "preprocess_video") as prep,
+            patch.object(
+                tm.material, "download_videos", return_value=["dl-1.mp4"]
+            ) as dl,
+        ):
+            result = tm.get_video_materials("task-dl-1", params, ["term"], 12)
+
+        prep.assert_not_called()
+        dl.assert_called_once()
+        self.assertEqual(result, ["dl-1.mp4"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1297,7 +1297,40 @@ def generate_video(
         return bgm_mix_succeeded
 
 
-def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
+def _resolve_extra_root_material(url, extra_allowed_roots):
+    """Resolve an absolute material URL as a direct child of an extra root.
+
+    Every candidate must be absolute, pass the shared confinement
+    primitive, contain no link or junction component (its normalized
+    lexical absolute path must equal its realpath), be a direct child
+    of the explicitly resolved approved root, and name a regular file.
+    Returns the resolved absolute path, or None so the caller skips
+    through the existing fail-closed behavior.
+    """
+    if not url or not os.path.isabs(url):
+        return None
+    lexical = os.path.normpath(os.path.abspath(url))
+    for root in extra_allowed_roots or ():
+        if not root:
+            continue
+        root_real = os.path.realpath(root)
+        try:
+            candidate = file_security.resolve_path_within_directory(
+                root_real, url
+            )
+        except ValueError:
+            continue
+        if os.path.normcase(lexical) != os.path.normcase(candidate):
+            continue
+        if os.path.normcase(os.path.dirname(candidate)) != os.path.normcase(
+            root_real
+        ):
+            continue
+        return candidate
+    return None
+
+
+def preprocess_video(materials: List[MaterialInfo], clip_duration=4, extra_allowed_roots=()):
     # WebUI 在某些二次生成场景下可能传入空素材列表，这里直接返回空结果，避免抛出 NoneType 异常。
     if not materials:
         return []
@@ -1315,14 +1348,18 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 local_videos_dir, material.url
             )
         except ValueError as exc:
-            # local video_source 的素材路径来自 API 参数，必须限制在专用素材目录。
-            # 允许用户传文件名，也兼容历史返回的绝对路径，但不允许逃逸到系统
-            # 其他目录，避免任意文件读取或通过 MoviePy 探测本地敏感文件。
-            logger.warning(
-                f"skip unsafe local material: {material.url}, "
-                f"local_videos_dir: {local_videos_dir}, error: {str(exc)}"
+            material_source_path = _resolve_extra_root_material(
+                material.url, extra_allowed_roots
             )
-            continue
+            if material_source_path is None:
+                # local video_source 的素材路径来自 API 参数，必须限制在专用素材目录。
+                # 允许用户传文件名，也兼容历史返回的绝对路径，但不允许逃逸到系统
+                # 其他目录，避免任意文件读取或通过 MoviePy 探测本地敏感文件。
+                logger.warning(
+                    f"skip unsafe local material: {material.url}, "
+                    f"local_videos_dir: {local_videos_dir}, error: {str(exc)}"
+                )
+                continue
 
         ext = utils.parse_extension(material_source_path)
         try:

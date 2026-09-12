@@ -9,36 +9,50 @@ from typing import Optional
 import requests
 from loguru import logger
 from app.config import config
+from app.services.pilot_policy import get_pilot_policy, PilotPolicyError
 
 
 class UploadPostService:
     API_BASE = "https://api.upload-post.com"
 
+    def _check_pilot_gate(self) -> None:
+        """Raise PilotPolicyError before any credentials or network activity."""
+        _policy = get_pilot_policy()
+        if _policy is not None:
+            _policy.require_not_upload_post()
+
     @property
     def api_key(self) -> str:
+        self._check_pilot_gate()
         return config.app.get("upload_post_api_key", "")
 
     @property
     def username(self) -> str:
+        self._check_pilot_gate()
         return config.app.get("upload_post_username", "")
 
     @property
     def enabled(self) -> bool:
+        self._check_pilot_gate()
         return config.app.get("upload_post_enabled", False)
 
     @property
     def platforms(self) -> list:
+        self._check_pilot_gate()
         return config.app.get("upload_post_platforms", ["tiktok", "instagram"])
 
     @property
     def auto_upload(self) -> bool:
+        self._check_pilot_gate()
         return config.app.get("upload_post_auto_upload", False)
 
     @property
     def youtube_privacy_status(self) -> str:
+        self._check_pilot_gate()
         return config.app.get("upload_post_youtube_privacy_status", "public")
 
     def is_configured(self) -> bool:
+        self._check_pilot_gate()
         return bool(self.api_key and self.username and self.enabled)
 
     def upload_video(
@@ -49,6 +63,7 @@ class UploadPostService:
         privacy_level: str = "PUBLIC_TO_EVERYONE",
         youtube_extra: Optional[dict] = None,
     ) -> dict:
+        self._check_pilot_gate()
         if not self.is_configured():
             logger.warning("Upload-Post is not configured. Skipping cross-post.")
             return {"success": False, "error": "Upload-Post not configured"}
@@ -119,6 +134,7 @@ class UploadPostService:
         Returns:
             dict: Status information
         """
+        self._check_pilot_gate()
         try:
             headers = {
                 'Authorization': f'Apikey {self.api_key}'

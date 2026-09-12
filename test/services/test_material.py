@@ -1656,5 +1656,480 @@ class TestWaveSpeedProvider(unittest.TestCase):
         self.assertEqual(result, ["/tmp/wavespeed-2.mp4"])
 
 
+class TestSaveVideoPilotMode(unittest.TestCase):
+    """
+    Phase 1B.2C.1 — save_video integration with app.utils.egress in
+    BrainTrustCrypto pilot mode. All network is mocked; no real calls.
+    """
+
+    def setUp(self):
+        from app.services.pilot_policy import reset_pilot_policy_cache
+        reset_pilot_policy_cache()
+        self._env_patcher = patch.dict(
+            os.environ, {"MPT_PILOT_PROFILE": "braintrustcrypto"}
+        )
+        self._env_patcher.start()
+
+    def tearDown(self):
+        self._env_patcher.stop()
+        from app.services.pilot_policy import reset_pilot_policy_cache
+        reset_pilot_policy_cache()
+
+    def _make_policy(self, hosts=("cdn.example.com",), allow_redirects=True,
+                     max_redirects=3):
+        policy = SimpleNamespace(
+            egress_allowed_hosts=frozenset(hosts),
+            egress_allow_redirects=allow_redirects,
+            egress_max_redirects=max_redirects,
+        )
+        return policy
+
+    def _video_response(self, body=b"fake-video", content_type="video/mp4",
+                        content_length=None):
+        resp = SimpleNamespace()
+        resp.status_code = 200
+        resp.headers = {"Content-Type": content_type}
+        if content_length is not None:
+            resp.headers["Content-Length"] = str(content_length)
+        else:
+            resp.headers["Content-Length"] = str(len(body))
+        resp.content = body
+        resp.raise_for_status = lambda: None
+        resp.iter_content = lambda chunk_size=8192: iter([body])
+        return resp
+
+    def _run_save(self, tmp_dir, url="https://cdn.example.com/v.mp4?token=secret123"):
+        return material.save_video(url, save_dir=tmp_dir)
+
+    def test_pilot_routes_through_safe_egress(self):
+        policy = self._make_policy()
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+             patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.safe_download") as mock_sd, \
+             patch("app.services.material.requests.get") as mock_get:
+            mock_sd.side_effect = lambda url, dest, pol, **kw: Path(dest).write_bytes(b"v") or Path(dest)
+            result = self._run_save(tmp_dir)
+            self.assertTrue(result.endswith(".mp4"))
+            mock_sd.assert_called_once()
+            mock_get.assert_not_called()
+
+    def test_pilot_no_legacy_fallback_on_egress_failure(self):
+        policy = self._make_policy()
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+             patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.safe_download",
+                   side_effect=Exception("blocked")) as mock_sd, \
+             patch("app.services.material.requests.get") as mock_get:
+            with self.assertRaises(Exception):
+                self._run_save(tmp_dir)
+            mock_sd.assert_called_once()
+            mock_get.assert_not_called()
+
+    def test_pilot_missing_allowlist_fails_closed(self):
+        policy = self._make_policy(hosts=())
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+             patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.safe_download") as mock_sd, \
+             patch("app.services.material.requests.get") as mock_get:
+            from app.services.pilot_policy import PilotPolicyError
+            with self.assertRaises(PilotPolicyError):
+                self._run_save(tmp_dir)
+            mock_sd.assert_not_called()
+            mock_get.assert_not_called()
+
+    def test_pilot_host_rejection(self):
+        from app.utils.egress import URLValidationError
+        policy = self._make_policy(hosts=("cdn.example.com",))
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+             patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.safe_download",
+                   side_effect=URLValidationError("hostname not in allowlist")), \
+             patch("app.services.material.requests.get") as mock_get:
+            with self.assertRaises(URLValidationError):
+                self._run_save(tmp_dir, url="https://evil.example.com/v.mp4")
+            mock_get.assert_not_called()
+
+    def test_pilot_unsafe_redirects_rejected(self):
+        from app.utils.egress import RedirectLimitExceededError
+        policy = self._make_policy(allow_redirects=True, max_redirects=3)
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+             patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.safe_download",
+                   side_effect=RedirectLimitExceededError("too many redirects")), \
+             patch("app.services.material.requests.get") as mock_get:
+            with self.assertRaises(RedirectLimitExceededError):
+                self._run_save(tmp_dir)
+            mock_get.assert_not_called()
+
+    def test_pilot_non_video_mime_rejected(self):
+        from app.utils.egress import MIMETypeNotAllowedError
+        policy = self._make_policy()
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+             patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.safe_download",
+                   side_effect=MIMETypeNotAllowedError("text/html not allowed")), \
+             patch("app.services.material.requests.get") as mock_get:
+            with self.assertRaises(MIMETypeNotAllowedError):
+                self._run_save(tmp_dir)
+            mock_get.assert_not_called()
+
+    def test_pilot_size_limit_enforced(self):
+        from app.utils.egress import SizeLimitExceededError
+        policy = self._make_policy()
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+             patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.safe_download",
+                   side_effect=SizeLimitExceededError("exceeds 512 MB")), \
+             patch("app.services.material.requests.get") as mock_get:
+            with self.assertRaises(SizeLimitExceededError):
+                self._run_save(tmp_dir)
+            mock_get.assert_not_called()
+
+    def test_pilot_timeouts_propagate(self):
+        policy = self._make_policy()
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+             patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.safe_download",
+                   side_effect=requests.Timeout("read timed out")), \
+             patch("app.services.material.requests.get") as mock_get:
+            with self.assertRaises(requests.Timeout):
+                self._run_save(tmp_dir)
+            mock_get.assert_not_called()
+
+    def test_pilot_partial_cleanup_on_failure(self):
+        policy = self._make_policy()
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+             patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.safe_download",
+                   side_effect=requests.ConnectionError("boom")), \
+             patch("app.services.material.requests.get"):
+            with self.assertRaises(requests.ConnectionError):
+                self._run_save(tmp_dir)
+            leftovers = [p for p in Path(tmp_dir).iterdir()
+                         if p.name.endswith(".partial") or p.name.startswith(".")]
+            self.assertEqual(leftovers, [])
+            self.assertEqual(list(Path(tmp_dir).glob("*.mp4")), [])
+
+    def test_pilot_destination_confined_to_save_dir(self):
+        policy = self._make_policy()
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+             patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.safe_download") as mock_sd:
+            mock_sd.side_effect = lambda url, dest, pol, **kw: Path(dest).write_bytes(b"v") or Path(dest)
+            result = self._run_save(tmp_dir)
+            self.assertTrue(os.path.abspath(result).startswith(os.path.abspath(tmp_dir)))
+            dest_arg = mock_sd.call_args[0][1]
+            self.assertTrue(os.path.abspath(str(dest_arg)).startswith(os.path.abspath(tmp_dir)))
+
+    def test_pilot_atomic_success(self):
+        policy = self._make_policy()
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+             patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.safe_download") as mock_sd:
+            def fake_sd(url, dest, pol, **kw):
+                Path(dest).write_bytes(b"video-bytes")
+                return Path(dest)
+            mock_sd.side_effect = fake_sd
+            result = self._run_save(tmp_dir)
+            self.assertTrue(os.path.exists(result))
+            with open(result, "rb") as fh:
+                self.assertEqual(fh.read(), b"video-bytes")
+
+    def test_pilot_url_query_not_logged(self):
+        policy = self._make_policy()
+        secret_url = "https://cdn.example.com/v.mp4?token=supersecretvalue"
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+             patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.safe_download",
+                   side_effect=requests.ConnectionError("denied")), \
+             patch("app.services.material.logger") as mock_logger:
+            with self.assertRaises(requests.ConnectionError):
+                material.save_video(secret_url, save_dir=tmp_dir)
+            logged = " ".join(
+                str(c.args[0]) for c in mock_logger.info.call_args_list
+                + mock_logger.warning.call_args_list
+                + mock_logger.error.call_args_list
+            )
+            self.assertNotIn("supersecretvalue", logged)
+
+    def test_pilot_existing_file_short_circuits(self):
+        policy = self._make_policy()
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+             patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.safe_download") as mock_sd, \
+             patch("app.services.material.requests.get") as mock_get:
+            url = "https://cdn.example.com/v.mp4"
+            vid = f"vid-{material.utils.md5(url.split('?')[0])}"
+            existing = Path(tmp_dir) / f"{vid}.mp4"
+            existing.write_bytes(b"cached")
+            result = material.save_video(url, save_dir=tmp_dir)
+            self.assertEqual(
+                os.path.normpath(result), os.path.normpath(str(existing))
+            )
+            mock_sd.assert_not_called()
+            mock_get.assert_not_called()
+
+    def test_pilot_egress_policy_construction(self):
+        """Verify EgressPolicy is built from pilot accessors with redirect cap."""
+        captured = {}
+        policy = self._make_policy(hosts=("a.com", "*.b.com"),
+                                   allow_redirects=True, max_redirects=3)
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+             patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.safe_download") as mock_sd:
+            def fake_sd(url, dest, pol, **kw):
+                captured["policy"] = pol
+                Path(dest).write_bytes(b"v")
+                return Path(dest)
+            mock_sd.side_effect = fake_sd
+            self._run_save(tmp_dir)
+            ep = captured["policy"]
+            self.assertEqual(ep.allowed_hosts, frozenset({"a.com", "*.b.com"}))
+            self.assertTrue(ep.allow_redirects)
+            self.assertEqual(ep.max_redirects, 3)
+            self.assertEqual(ep.max_bytes_video, 512 * 1024 * 1024)
+
+
+class TestSearchVideosPexelsPilotMode(unittest.TestCase):
+    """
+    Phase 1B.2C.2 — Pexels search integration with safe_json_get in
+    BrainTrustCrypto pilot mode. All network is mocked; no real calls.
+    """
+
+    def setUp(self):
+        from app.services.pilot_policy import reset_pilot_policy_cache
+        reset_pilot_policy_cache()
+        self._env_patcher = patch.dict(
+            os.environ, {"MPT_PILOT_PROFILE": "braintrustcrypto"}
+        )
+        self._env_patcher.start()
+
+    def tearDown(self):
+        self._env_patcher.stop()
+        from app.services.pilot_policy import reset_pilot_policy_cache
+        reset_pilot_policy_cache()
+
+    def _make_policy(self, hosts=("api.pexels.com",)):
+        return SimpleNamespace(
+            egress_allowed_hosts=frozenset(hosts),
+            egress_allow_redirects=False,
+            egress_max_redirects=0,
+        )
+
+    def _pexels_payload(self):
+        return {
+            "videos": [
+                {
+                    "id": 123,
+                    "duration": 10,
+                    "url": "https://www.pexels.com/video/123/",
+                    "user": {"name": "creator", "url": "https://pexels.com/u/1"},
+                    "video_files": [
+                        {
+                            "id": 456,
+                            "width": 1080,
+                            "height": 1920,
+                            "link": "https://videos.pexels.com/v/123.mp4",
+                        }
+                    ],
+                }
+            ]
+        }
+
+    def test_pilot_pexels_routes_through_safe_json_get(self):
+        policy = self._make_policy()
+        with patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.get_api_key", return_value="test-key"), \
+             patch("app.services.material.safe_json_get",
+                   return_value=self._pexels_payload()) as mock_sjg, \
+             patch("app.services.material.requests.get") as mock_get:
+            results = material.search_videos_pexels("nature", minimum_duration=5)
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0].provider, "pexels")
+            self.assertEqual(results[0].url, "https://videos.pexels.com/v/123.mp4")
+            mock_sjg.assert_called_once()
+            mock_get.assert_not_called()
+
+    def test_pilot_pexels_no_fallback_on_failure(self):
+        policy = self._make_policy()
+        with patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.get_api_key", return_value="test-key"), \
+             patch("app.services.material.safe_json_get",
+                   side_effect=requests.ConnectionError("blocked")) as mock_sjg, \
+             patch("app.services.material.requests.get") as mock_get:
+            results = material.search_videos_pexels("nature", minimum_duration=5)
+            self.assertEqual(results, [])
+            mock_sjg.assert_called_once()
+            mock_get.assert_not_called()
+
+    def test_pilot_pexels_missing_allowlist_fails_closed(self):
+        policy = self._make_policy(hosts=())
+        from app.services.pilot_policy import PilotPolicyError
+        with patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.safe_json_get") as mock_sjg, \
+             patch("app.services.material.requests.get") as mock_get:
+            with self.assertRaises(PilotPolicyError):
+                material.search_videos_pexels("nature", minimum_duration=5)
+            mock_sjg.assert_not_called()
+            mock_get.assert_not_called()
+
+    def test_pilot_pexels_missing_api_key_fails_without_logging(self):
+        policy = self._make_policy()
+        from app.services.pilot_policy import PilotPolicyError
+        with patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.get_api_key", return_value=""), \
+             patch("app.services.material.safe_json_get") as mock_sjg, \
+             patch("app.services.material.logger") as mock_logger:
+            with self.assertRaises(PilotPolicyError) as ctx:
+                material.search_videos_pexels("nature", minimum_duration=5)
+            self.assertIn("API key is missing", str(ctx.exception))
+            mock_sjg.assert_not_called()
+            # Ensure no log contains any key material
+            logged = " ".join(
+                str(c.args[0]) for c in mock_logger.info.call_args_list
+                + mock_logger.warning.call_args_list
+                + mock_logger.error.call_args_list
+            )
+            self.assertNotIn("Authorization", logged)
+
+    def test_pilot_pexels_rejected_redirect(self):
+        from app.utils.egress import EgressPolicyError
+        policy = self._make_policy()
+        with patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.get_api_key", return_value="test-key"), \
+             patch("app.services.material.safe_json_get",
+                   side_effect=EgressPolicyError("redirect rejected")), \
+             patch("app.services.material.requests.get") as mock_get:
+            results = material.search_videos_pexels("nature", minimum_duration=5)
+            self.assertEqual(results, [])
+            mock_get.assert_not_called()
+
+    def test_pilot_pexels_private_target_rejected(self):
+        from app.utils.egress import IPBlockedError
+        policy = self._make_policy()
+        with patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.get_api_key", return_value="test-key"), \
+             patch("app.services.material.safe_json_get",
+                   side_effect=IPBlockedError("private IP")), \
+             patch("app.services.material.requests.get") as mock_get:
+            results = material.search_videos_pexels("nature", minimum_duration=5)
+            self.assertEqual(results, [])
+            mock_get.assert_not_called()
+
+    def test_pilot_pexels_invalid_mime(self):
+        from app.utils.egress import MIMETypeNotAllowedError
+        policy = self._make_policy()
+        with patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.get_api_key", return_value="test-key"), \
+             patch("app.services.material.safe_json_get",
+                   side_effect=MIMETypeNotAllowedError("text/html")), \
+             patch("app.services.material.requests.get") as mock_get:
+            results = material.search_videos_pexels("nature", minimum_duration=5)
+            self.assertEqual(results, [])
+            mock_get.assert_not_called()
+
+    def test_pilot_pexels_oversized_body(self):
+        from app.utils.egress import SizeLimitExceededError
+        policy = self._make_policy()
+        with patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.get_api_key", return_value="test-key"), \
+             patch("app.services.material.safe_json_get",
+                   side_effect=SizeLimitExceededError("too large")), \
+             patch("app.services.material.requests.get") as mock_get:
+            results = material.search_videos_pexels("nature", minimum_duration=5)
+            self.assertEqual(results, [])
+            mock_get.assert_not_called()
+
+    def test_pilot_pexels_malformed_json(self):
+        from app.utils.egress import MalformedJSONError
+        policy = self._make_policy()
+        with patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.get_api_key", return_value="test-key"), \
+             patch("app.services.material.safe_json_get",
+                   side_effect=MalformedJSONError("bad json")), \
+             patch("app.services.material.requests.get") as mock_get:
+            results = material.search_videos_pexels("nature", minimum_duration=5)
+            self.assertEqual(results, [])
+            mock_get.assert_not_called()
+
+    def test_pilot_pexels_timeout(self):
+        policy = self._make_policy()
+        with patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.get_api_key", return_value="test-key"), \
+             patch("app.services.material.safe_json_get",
+                   side_effect=requests.Timeout("read timed out")), \
+             patch("app.services.material.requests.get") as mock_get:
+            results = material.search_videos_pexels("nature", minimum_duration=5)
+            self.assertEqual(results, [])
+            mock_get.assert_not_called()
+
+    def test_pilot_pexels_http_error(self):
+        policy = self._make_policy()
+        with patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.get_api_key", return_value="test-key"), \
+             patch("app.services.material.safe_json_get",
+                   side_effect=requests.HTTPError("403 Forbidden")), \
+             patch("app.services.material.requests.get") as mock_get:
+            results = material.search_videos_pexels("nature", minimum_duration=5)
+            self.assertEqual(results, [])
+            mock_get.assert_not_called()
+
+    def test_pilot_pexels_api_key_redacted_from_error_log(self):
+        policy = self._make_policy()
+        secret_key = "pexels-secret-key-abcdef-12345"
+        with patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.get_api_key", return_value=secret_key), \
+             patch("app.services.material.safe_json_get",
+                   side_effect=requests.ConnectionError(
+                       f"connection failed for key={secret_key}"
+                   )), \
+             patch("app.services.material.logger") as mock_logger:
+            results = material.search_videos_pexels("nature", minimum_duration=5)
+            self.assertEqual(results, [])
+            logged = " ".join(
+                str(c.args[0]) for c in mock_logger.error.call_args_list
+                + mock_logger.warning.call_args_list
+                + mock_logger.info.call_args_list
+            )
+            self.assertNotIn(secret_key, logged)
+
+    def test_pilot_pexels_response_urls_not_implicitly_trusted(self):
+        """
+        URLs from the Pexels API response must NOT be implicitly trusted.
+        When download_videos later calls save_video with these URLs, save_video
+        must re-validate them through safe egress (its own pilot branch).
+        """
+        policy = self._make_policy(hosts=("api.pexels.com", "videos.pexels.com"))
+        payload = self._pexels_payload()
+        # Inject a URL pointing to a non-allowlisted host
+        payload["videos"][0]["video_files"][0]["link"] = \
+            "https://evil-cdn.attacker.com/malware.mp4"
+        with patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.get_api_key", return_value="test-key"), \
+             patch("app.services.material.safe_json_get", return_value=payload):
+            results = material.search_videos_pexels("nature", minimum_duration=5)
+            self.assertEqual(len(results), 1)
+            # The URL is passed through as-is; save_video is responsible for
+            # re-validating it against the egress allowlist at download time.
+            self.assertEqual(
+                results[0].url, "https://evil-cdn.attacker.com/malware.mp4"
+            )
+
+    def test_pilot_pexels_headers_passed_to_safe_json_get(self):
+        policy = self._make_policy()
+        captured = {}
+        with patch("app.services.material.get_pilot_policy", return_value=policy), \
+             patch("app.services.material.get_api_key", return_value="test-key-123"), \
+             patch("app.services.material.safe_json_get",
+                   return_value={"videos": []}) as mock_sjg:
+            material.search_videos_pexels("nature", minimum_duration=5)
+            call_kwargs = mock_sjg.call_args
+            headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers", {})
+            self.assertEqual(headers.get("Authorization"), "test-key-123")
+            # secrets_to_redact must include the API key
+            secrets = call_kwargs.kwargs.get("secrets_to_redact") or call_kwargs[1].get("secrets_to_redact", ())
+            self.assertIn("test-key-123", secrets)
+
+
 if __name__ == "__main__":
     unittest.main()

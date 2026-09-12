@@ -14,7 +14,9 @@ from moviepy.video.io.VideoFileClip import VideoFileClip
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
 from app.services import material_cache, task_artifacts, volcengine_seedance
+from app.services.pilot_policy import get_pilot_policy, PilotPolicyError
 from app.utils import utils
+from app.utils.egress import EgressPolicy, safe_download, safe_json_get
 
 # Thread-safe counter for API key rotation
 _api_key_counter = 0
@@ -293,6 +295,110 @@ def _filter_materials_by_aspect(
     return filtered_items
 
 
+def _search_videos_pexels_pilot(
+    search_term: str,
+    minimum_duration: int,
+    aspect: VideoAspect,
+    video_orientation: str,
+    video_width: int,
+    video_height: int,
+) -> List[MaterialInfo]:
+    """
+    BrainTrustCrypto pilot-mode Pexels search.
+
+    Always uses safe_json_get; no direct requests fallback. Fails closed on
+    missing allowlist or missing API key (key is never logged).
+    """
+    policy = get_pilot_policy()
+    if policy is None:
+        raise PilotPolicyError("pilot policy not loaded")
+
+    allowed_hosts = policy.egress_allowed_hosts
+    if not allowed_hosts:
+        raise PilotPolicyError(
+            "pilot egress allowlist is missing or empty; refusing Pexels search"
+        )
+
+    api_key = get_api_key("pexels_api_keys")
+    if not api_key:
+        raise PilotPolicyError(
+            "pilot mode requires pexels_api_keys to be configured; "
+            "API key is missing"
+        )
+
+    egress_policy = EgressPolicy(allowed_hosts=allowed_hosts)
+
+    params = {"query": search_term, "per_page": 20, "orientation": video_orientation}
+    query_url = f"https://api.pexels.com/v1/videos/search?{urlencode(params)}"
+    logger.info(f"searching videos on pexels (pilot): term={search_term!r}")
+
+    headers = {
+        "Authorization": api_key,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    }
+
+    try:
+        response = safe_json_get(
+            query_url,
+            egress_policy,
+            headers=headers,
+            audit_logger=logger,
+            secrets_to_redact=(api_key,),
+        )
+    except Exception as e:
+        logger.error(
+            "pexels video search failed (pilot): "
+            f"error={type(e).__name__}, detail={_redact_request_error(e, api_key)}"
+        )
+        return []
+
+    video_items: List[MaterialInfo] = []
+    if not isinstance(response, dict) or "videos" not in response:
+        logger.error("pexels video search returned an unsupported response (pilot)")
+        return video_items
+    videos = response["videos"]
+    for v in videos:
+        duration = v["duration"]
+        if duration < minimum_duration:
+            continue
+        video_files = v["video_files"]
+        for video in video_files:
+            w = int(video["width"])
+            h = int(video["height"])
+            if (
+                _matches_video_aspect(w, h, aspect)
+                and w == video_width
+                and h == video_height
+            ):
+                item = MaterialInfo()
+                item.provider = "pexels"
+                # URLs from the API response are NOT implicitly trusted;
+                # save_video re-validates them through safe egress.
+                item.url = video["link"]
+                item.duration = duration
+                item.source_info = {
+                    "provider": "pexels",
+                    "search_term": search_term,
+                    "asset_id": (
+                        str(v.get("id")) if v.get("id") is not None else None
+                    ),
+                    "source_page": _safe_public_url(v.get("url")),
+                    "creator": _creator_info(v.get("user")),
+                    "rendition": {
+                        "id": (
+                            str(video.get("id"))
+                            if video.get("id") is not None
+                            else None
+                        ),
+                        "width": w,
+                        "height": h,
+                    },
+                }
+                video_items.append(item)
+                break
+    return video_items
+
+
 def search_videos_pexels(
     search_term: str,
     minimum_duration: int,
@@ -301,6 +407,18 @@ def search_videos_pexels(
     aspect = VideoAspect(video_aspect)
     video_orientation = aspect.name
     video_width, video_height = aspect.to_resolution()
+
+    # BrainTrustCrypto pilot mode: always use safe egress, no fallback.
+    if get_pilot_policy() is not None:
+        return _search_videos_pexels_pilot(
+            search_term,
+            minimum_duration,
+            aspect,
+            video_orientation,
+            video_width,
+            video_height,
+        )
+
     api_key = get_api_key("pexels_api_keys")
     headers = {
         "Authorization": api_key,
@@ -375,11 +493,40 @@ def search_videos_pexels(
     return []
 
 
+def _require_pilot_provider_allowed(provider_name: str) -> None:
+    """
+    BrainTrustCrypto pilot-mode gate for unapproved material providers.
+
+    When the pilot profile is active, only Pexels is a potentially permitted
+    stock-media provider (and even Pexels requires a separately approved
+    host allowlist and API key). All other providers — Pixabay, Coverr,
+    Wavespeed, and any future additions — must fail closed before any
+    credentials are read, SDKs are initialized, or network requests occur.
+
+    This function is a no-op when pilot mode is not active, preserving
+    existing upstream behavior.
+    """
+    policy = get_pilot_policy()
+    if policy is None:
+        return  # Pilot mode not active — upstream behavior preserved
+
+    raise PilotPolicyError(
+        f"BrainTrustCrypto pilot mode prohibits material provider "
+        f"'{provider_name}'. Only Pexels is potentially permitted, and "
+        f"Pexels requires a separately approved host allowlist and API key. "
+        f"Provider '{provider_name}' must be explicitly approved before use.",
+        policy_path=getattr(policy, 'policy_path', None),
+    )
+
+
 def search_videos_pixabay(
     search_term: str,
     minimum_duration: int,
     video_aspect: VideoAspect = VideoAspect.portrait,
 ) -> List[MaterialInfo]:
+    # BrainTrustCrypto pilot mode: deny Pixabay before any network request.
+    _require_pilot_provider_allowed("pixabay")
+
     aspect = VideoAspect(video_aspect)
 
     video_width, video_height = aspect.to_resolution()
@@ -524,6 +671,9 @@ def search_videos_coverr(
     GET 这个 URL 本身就被 Coverr 当作一次合法的 download 事件计入统计,
     无需再调用 PATCH /videos/:id/stats/downloads。
     """
+    # BrainTrustCrypto pilot mode: deny Coverr before any network request.
+    _require_pilot_provider_allowed("coverr")
+
     aspect = VideoAspect(video_aspect)
     api_key = get_api_key("coverr_api_keys")
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -708,6 +858,10 @@ def generate_videos_wavespeed(
     使其可以直接接入 ``download_videos`` 的通用下载与时长核算流程。
     ``minimum_duration`` 在生成语境下就是目标片段时长（秒）。
     """
+    # BrainTrustCrypto pilot mode: deny Wavespeed before credentials are
+    # read, SDKs are initialized, or network requests occur.
+    _require_pilot_provider_allowed("wavespeed")
+
     aspect = VideoAspect(video_aspect)
     video_width, video_height = aspect.to_resolution()
     api_key = get_api_key("wavespeed_api_keys")
@@ -864,6 +1018,12 @@ def _wait_for_wavespeed_prediction(
     线性退避重试同一个 ID，绝不重新提交任务；状态始终无法确认时抛出
     :class:`WaveSpeedUnconfirmedTaskError`，由调用方终止整个生成流程。
     """
+    # BrainTrustCrypto pilot mode: deny Wavespeed polling before any
+    # network request. This is defense-in-depth — generate_videos_wavespeed
+    # already gates submission, but polling must also fail closed if called
+    # directly or through a future code path.
+    _require_pilot_provider_allowed("wavespeed")
+
     deadline = time.monotonic() + WAVESPEED_RUN_TIMEOUT_SECONDS
     consecutive_failures = 0
     while True:
@@ -989,6 +1149,44 @@ def _save_generated_video_with_retry(
     return ""
 
 
+def _save_video_pilot(video_url: str, save_dir: str, video_path: str) -> str:
+    """
+    BrainTrustCrypto pilot-mode download path.
+
+    Always uses safe egress; no legacy requests fallback. Fails closed on
+    missing/empty allowlist, non-HTTPS, disallowed hosts, unsafe redirects,
+    non-video MIME, oversize, timeouts, and traversal. Partial files are
+    cleaned up by safe_download; atomic rename only after success.
+    """
+    policy = get_pilot_policy()
+    if policy is None:
+        raise PilotPolicyError("pilot policy not loaded")
+
+    allowed_hosts = policy.egress_allowed_hosts
+    if not allowed_hosts:
+        raise PilotPolicyError(
+            "pilot egress allowlist is missing or empty; refusing download"
+        )
+
+    egress_policy = EgressPolicy(
+        allowed_hosts=allowed_hosts,
+        allow_redirects=policy.egress_allow_redirects,
+        max_redirects=policy.egress_max_redirects,
+    )
+
+    # safe_download enforces: HTTPS-only, host allowlist, IP blocklist,
+    # redirect revalidation, video MIME allowlist, 512 MB declared+streamed
+    # limit, connect/read timeouts, partial-file cleanup, atomic rename.
+    # Destination is confined to save_dir (the designated task/material dir).
+    safe_download(
+        video_url,
+        video_path,
+        egress_policy,
+        audit_logger=logger,
+    )
+    return video_path
+
+
 def save_video(video_url: str, save_dir: str = "") -> str:
     if not save_dir:
         save_dir = utils.storage_dir("cache_videos")
@@ -1005,6 +1203,10 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
         logger.info(f"video already exists: {video_path}")
         return video_path
+
+    # BrainTrustCrypto pilot mode: always use safe egress, no fallback.
+    if get_pilot_policy() is not None:
+        return _save_video_pilot(video_url, save_dir, video_path)
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"

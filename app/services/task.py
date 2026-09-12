@@ -28,6 +28,7 @@ from app.services import (
     volcengine_seedance,
     voice,
 )
+from app.services import pilot_policy
 from app.services import upload_post
 from app.services import state as sm
 from app.utils import file_security, utils
@@ -47,6 +48,24 @@ _cross_post_max_pending_tasks = max(
 _cross_post_slots = threading.BoundedSemaphore(_cross_post_max_pending_tasks)
 _cross_post_registry_lock = threading.RLock()
 _cross_post_futures: dict[str, Future] = {}
+
+
+def _cross_posting_enabled() -> bool:
+    """Return whether deferred cross-posting may run for this task.
+
+    An active BrainTrustCrypto pilot policy decides publishing is disabled
+    BEFORE any upload_post service property or method is consulted: the
+    service's fail-closed gates raise on access in pilot mode, so touching
+    the service here would fail an otherwise complete render. get_pilot_policy()
+    returns None when the pilot profile is inactive (confirmed contract in
+    app.services.pilot_policy). Non-pilot behavior (configured service plus
+    auto_upload) is unchanged.
+    """
+    return (
+        pilot_policy.get_pilot_policy() is None
+        and upload_post.upload_post_service.is_configured()
+        and upload_post.upload_post_service.auto_upload
+    )
 _cross_post_process_owner = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex}"
 _ACTIVE_CROSS_POST_STATES = {
     const.CROSS_POST_STATE_PENDING,
@@ -612,7 +631,11 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     if subtitle_provider == "whisper":
         subtitle.create(audio_file=audio_file, subtitle_file=subtitle_path)
         logger.info("\n\n## correcting subtitle")
-        subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
+        subtitle.correct(
+            subtitle_file=subtitle_path,
+            video_script=video_script,
+            correction_mode=config.app.get("subtitle_correction_mode"),
+        )
 
     subtitle_lines = subtitle.file_to_subtitles(subtitle_path)
     if not subtitle_lines:
@@ -631,8 +654,15 @@ def get_video_materials(
 ):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
+        # 只允许本任务自己的 materials 目录作为额外受信根；这里仅做词法上的
+        # 归一化，不创建、不检查、不写入该目录。
+        task_materials_root = os.path.realpath(
+            os.path.join(utils.storage_dir(), "tasks", task_id, "materials")
+        )
         materials = video.preprocess_video(
-            materials=params.video_materials, clip_duration=params.video_clip_duration
+            materials=params.video_materials,
+            clip_duration=params.video_clip_duration,
+            extra_allowed_roots=(task_materials_root,),
         )
         if not materials:
             _mark_task_failed(
@@ -1449,10 +1479,7 @@ def _run_pipeline(
 
     # 7. 先完成视频生成任务，再按需提交跨平台发布。第三方上传可能耗时
     # 数分钟，不应阻塞视频结果返回，也不能反向影响已经生成的成片。
-    cross_post_enabled = (
-        upload_post.upload_post_service.is_configured()
-        and upload_post.upload_post_service.auto_upload
-    )
+    cross_post_enabled = _cross_posting_enabled()
     platforms = (
         list(upload_post.upload_post_service.platforms) if cross_post_enabled else []
     )

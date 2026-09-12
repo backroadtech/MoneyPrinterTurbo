@@ -1,5 +1,6 @@
 """检查 MoneyPrinterTurbo 是否存在可用的新正式版本。"""
 
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -28,6 +29,11 @@ RELEASE_CHECK_HEADERS: Final = {
 UPDATE_CHECK_CACHE_TTL_SECONDS: Final = 12 * 60 * 60
 
 
+def _is_pilot_mode() -> bool:
+    """Return True when BrainTrustCrypto pilot mode is active."""
+    return os.getenv("MPT_PILOT_PROFILE", "").strip().lower() == "braintrustcrypto"
+
+
 def _parse_version(value: str) -> Version:
     """兼容 GitHub 常用的 ``v1.2.3`` 标签并转换为可比较版本。"""
     normalized = str(value or "").strip()
@@ -44,7 +50,16 @@ def get_available_update(current_version: str) -> str | None:
     重复实现发布状态筛选。WebUI 通过 ``AsyncUpdateChecker`` 在后台调用本函数；
     网络、响应格式或版本标签异常时只记录日志并降级为“不显示通知”，不影响
     视频生成等核心功能。
+
+    BrainTrustCrypto pilot mode: fail closed before any network request.
     """
+    # Phase 1B.2D.1: Block automatic network activity in pilot mode
+    if _is_pilot_mode():
+        logger.debug(
+            "BrainTrustCrypto pilot mode: version/update checking is disabled"
+        )
+        return None
+
     try:
         installed_version = _parse_version(current_version)
     except InvalidVersion:
@@ -134,7 +149,18 @@ class AsyncUpdateChecker:
         self._checking = False
 
     def poll(self, current_version: str) -> UpdateCheckSnapshot:
-        """立即返回检查快照；缓存过期时在后台启动一次新检查。"""
+        """立即返回检查快照；缓存过期时在后台启动一次新检查。
+
+        BrainTrustCrypto pilot mode: return a deterministic completed/disabled
+        result before any thread creation, scheduling, or network access.
+        """
+        # Phase 1B.2D.1: Block automatic network activity in pilot mode
+        if _is_pilot_mode():
+            logger.debug(
+                "BrainTrustCrypto pilot mode: async version/update checking is disabled"
+            )
+            return UpdateCheckSnapshot(complete=True, available_version=None)
+
         normalized_current_version = str(current_version or "").strip()
         now = self._clock()
 
@@ -197,5 +223,16 @@ _ASYNC_UPDATE_CHECKER = AsyncUpdateChecker()
 
 
 def poll_available_update(current_version: str) -> UpdateCheckSnapshot:
-    """读取全局后台检查器状态，避免不同 Streamlit 会话重复请求 GitHub。"""
+    """读取全局后台检查器状态，避免不同 Streamlit 会话重复请求 GitHub。
+
+    BrainTrustCrypto pilot mode: return a deterministic completed/disabled
+    result before any thread creation, scheduling, or network access.
+    """
+    # Phase 1B.2D.1: Block automatic network activity in pilot mode
+    if _is_pilot_mode():
+        logger.debug(
+            "BrainTrustCrypto pilot mode: poll_available_update is disabled"
+        )
+        return UpdateCheckSnapshot(complete=True, available_version=None)
+
     return _ASYNC_UPDATE_CHECKER.poll(current_version)

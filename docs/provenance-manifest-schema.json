@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://braintrustcrypto.local/schemas/provenance-manifest.schema.json",
+  "title": "BrainTrustCrypto Provenance Manifest",
+  "description": "Offline provenance and human-review manifest (Phase 1B.3A/1B.3C.2A/1B.3C.2B.2B), schema 1.2.0. Every new manifest defaults to NEEDS_HUMAN_REVIEW. Secrets, credentials, and full sensitive prompts are never recorded; only prompt hashes are stored. Existing 1.0.0 and 1.1.0 manifests remain valid and are only upgraded through explicit migration functions; they are never silently reinterpreted or overwritten. Schema 1.2.0 adds immutable claim_id for every factual claim; claim_id is conditionally required (and non-null) only when task.schema_version is 1.2.0 — 1.0.0 and 1.1.0 manifests remain valid without it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task", "script", "assets", "factual_claims", "ai_generations", "output"],
+  "properties": {
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "task_id", "created_at", "topic", "pilot_profile", "review_status"],
+      "properties": {
+        "schema_version": { "type": "string", "enum": ["1.2.0", "1.1.0", "1.0.0"], "description": "New manifests are 1.2.0; 1.0.0 and 1.1.0 manifests remain valid for read/validate and explicit migration only" },
+        "task_id": { "type": "string", "minLength": 1 },
+        "created_at": { "type": "string", "format": "date-time", "description": "UTC ISO-8601 timestamp" },
+        "topic": { "type": "string", "minLength": 1 },
+        "pilot_profile": { "type": "string", "minLength": 1 },
+        "review_status": { "type": "string", "enum": ["NEEDS_HUMAN_REVIEW", "APPROVED", "REJECTED"], "default": "NEEDS_HUMAN_REVIEW" }
+      }
+    },
+    "script": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["local_path", "sha256", "generation_source", "ai_provider", "ai_model", "prompt_hash"],
+      "properties": {
+        "local_path": { "type": "string", "description": "Path relative to the task directory" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "generation_source": { "type": "string", "minLength": 1 },
+        "ai_provider": { "type": ["string", "null"] },
+        "ai_model": { "type": ["string", "null"] },
+        "prompt_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the prompt only; the full sensitive prompt is never stored" }
+      }
+    },
+    "assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["asset_type", "source_type", "source_url", "provider", "provider_asset_id", "retrieval_date", "local_path", "sha256", "license_name", "license_evidence", "notes"],
+        "properties": {
+          "asset_type": { "type": "string", "enum": ["video", "audio", "image", "text", "subtitle", "other"] },
+          "source_type": { "type": "string", "enum": ["local", "provider", "ai_generated"] },
+          "source_url": { "type": ["string", "null"], "description": "Required for provider assets; optional for local/ai_generated" },
+          "provider": { "type": ["string", "null"], "description": "Required for provider and ai_generated assets" },
+          "provider_asset_id": { "type": ["string", "null"], "description": "Required for provider assets" },
+          "retrieval_date": { "type": ["string", "null"], "format": "date-time", "description": "Required for provider assets" },
+          "local_path": { "type": "string" },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "license_name": { "type": "string", "minLength": 1 },
+          "license_evidence": { "type": "string", "minLength": 1, "description": "License evidence/reference; required for every asset including local" },
+          "notes": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "factual_claims": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["claim_text", "source_url", "source_publication_date", "retrieval_date", "status", "reviewer", "review_date", "supporting_sources", "reviewer_id", "reviewer_display_name", "review_timestamp_utc", "notes"],
+        "properties": {
+          "claim_id": { "type": ["string", "null"], "pattern": "^claim-[0-9a-f]{32}$", "description": "Immutable claim identifier derived from SHA-256 of canonical JSON (task_id, ordinal, normalized claim_text, source_url). Required and non-null for schema 1.2.0 via the top-level allOf conditional below; optional and nullable for legacy 1.0.0/1.1.0 manifests (a present string must still match the pattern). Uniqueness within the manifest is enforced by Python validation; JSON Schema cannot express array uniqueness." },
+          "claim_text": { "type": "string", "minLength": 1 },
+          "source_url": { "type": "string", "minLength": 1, "description": "May satisfy the VERIFIED supporting-HTTPS-URL requirement" },
+          "source_publication_date": { "type": ["string", "null"] },
+          "retrieval_date": { "type": ["string", "null"], "format": "date-time" },
+          "status": { "type": "string", "enum": ["UNVERIFIED", "VERIFIED", "RETRACTED"], "default": "UNVERIFIED" },
+          "reviewer": { "type": ["string", "null"], "description": "Legacy 1.0.0 accountability field; required for VERIFIED/RETRACTED when reviewer_id is not used" },
+          "review_date": { "type": ["string", "null"], "format": "date-time", "description": "Legacy 1.0.0 accountability field; required for VERIFIED/RETRACTED when review_timestamp_utc is not used" },
+          "supporting_sources": { "type": ["array", "null"], "items": { "type": "string" }, "description": "Schema 1.1.0: optional additional supporting URLs; a VERIFIED claim needs at least one valid HTTPS URL across source_url and supporting_sources" },
+          "reviewer_id": { "type": ["string", "null"], "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$", "description": "Schema 1.1.0 reviewer identity (lowercase, 1-64 chars)" },
+          "reviewer_display_name": { "type": ["string", "null"], "minLength": 1, "maxLength": 128, "description": "Schema 1.1.0 reviewer display name; control characters rejected" },
+          "review_timestamp_utc": { "type": ["string", "null"], "format": "date-time", "description": "Schema 1.1.0 review timestamp (UTC)" },
+          "notes": { "type": ["string", "null"], "description": "Schema 1.1.0: explanatory notes; required for RETRACTED claims using the 1.1.0 reviewer identity fields" }
+        }
+      }
+    },
+    "ai_generations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["provider", "model", "generation_timestamp", "output_type", "prompt_hash", "parameters"],
+        "properties": {
+          "provider": { "type": "string", "minLength": 1 },
+          "model": { "type": "string", "minLength": 1 },
+          "generation_timestamp": { "type": "string", "format": "date-time" },
+          "output_type": { "type": "string", "enum": ["text", "image", "audio", "video", "script", "other"] },
+          "prompt_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "parameters": { "type": "object", "description": "Non-secret generation parameters only; credential-like keys are rejected" }
+        }
+      }
+    },
+    "output": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["local_path", "sha256", "review_status", "filename_marker", "visible_watermark_required"],
+      "properties": {
+        "local_path": { "type": "string" },
+        "sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+        "review_status": { "type": "string", "enum": ["NEEDS_HUMAN_REVIEW", "APPROVED", "REJECTED", "SUPERSEDED"], "default": "NEEDS_HUMAN_REVIEW", "description": "REVOKED is intentionally NOT a value; revocation is recorded via receipt, never by mutating output.review_status" },
+        "filename_marker": { "type": "string", "description": "Filename carrying the __NEEDS_HUMAN_REVIEW marker while unreviewed" },
+        "visible_watermark_required": { "type": "boolean", "const": false }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "description": "Version-conditional claim_id: schema 1.2.0 requires a non-null claim_id matching ^claim-[0-9a-f]{32}$ for every factual claim; legacy 1.0.0/1.1.0 manifests are unaffected and remain valid without claim_id",
+      "if": {
+        "properties": {
+          "task": {
+            "properties": {
+              "schema_version": { "const": "1.2.0" }
+            },
+            "required": ["schema_version"]
+          }
+        },
+        "required": ["task"]
+      },
+      "then": {
+        "properties": {
+          "factual_claims": {
+            "items": {
+              "required": ["claim_id"],
+              "properties": {
+                "claim_id": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

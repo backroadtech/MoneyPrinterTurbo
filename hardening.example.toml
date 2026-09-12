@@ -1,0 +1,73 @@
+# BrainTrustCrypto — Hardening Configuration
+# This file controls pilot-mode restrictions and security policy.
+# It is gitignored by default (contains local paths and policy choices).
+# Copy to hardening.toml and adjust as needed.
+
+[pilot]
+# CLI-only mode. No API server, no WebUI, no background services.
+mode = "cli"
+api_server_enabled = false
+webui_enabled = false
+upload_post_enabled = false
+redis_enabled = false
+
+[output]
+# All generated content goes here. Gitignored.
+directory = "./storage/braintrustcrypto_output"
+# Review status marker. Appears in manifest, sidecar file, and filename suffix.
+# NOT burned into the video as a visible watermark.
+review_marker = "NEEDS_HUMAN_REVIEW"
+provenance_manifest = true
+
+[llm]
+# No LLM provider configured for Phase 1A.
+# Rick will fill this in during a later approved phase.
+provider = ""
+model = ""
+
+[tts]
+# Edge TTS requires no API key. Selected as placeholder for pilot.
+# Not yet active — no TTS integration in Phase 1A.
+provider = "edge"
+voice = ""
+
+[materials]
+# No stock media downloads in Phase 1A.
+# Rick will configure during a later approved phase.
+video_source = "local"
+
+[bgm]
+# No bundled music. All bundled songs are quarantined.
+# Rick will supply licensed tracks during a later approved phase.
+source = "none"
+
+[egress]
+# Egress controls centrally enforce:
+#   - HTTPS only
+#   - Approved hosts (allowlist)
+#   - Redirect revalidation
+#   - Timeouts
+#   - Response-size limits
+#   - Content-type checks
+#   - Blocking of loopback/private/link-local destinations
+#
+# Phase 1B.2C: save_video and Pexels search use these settings in pilot mode.
+# Missing or empty allowed_hosts fails closed (all egress refused).
+#
+# Hostname allowlist: exact matches or boundary-safe subdomain rules.
+# Example: "api.pexels.com" matches exactly; "*.pexels.com" matches subdomains.
+# Leave empty until Rick approves real hosts — empty fails closed.
+allowed_hosts = []
+
+# Redirect policy for media downloads (save_video).
+# API/JSON calls always reject redirects regardless of this setting.
+allow_redirects = false
+# Maximum revalidated redirects when allow_redirects = true. Capped at 3.
+max_redirects = 3
+
+blocked_hosts = [
+  "*.tiktok.com",
+  "*.instagram.com",
+  "*.youtube.com",
+  "upload-post.com",
+]

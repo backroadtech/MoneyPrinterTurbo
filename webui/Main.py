@@ -1,3 +1,26 @@
+# BrainTrustCrypto pilot mode prohibits WebUI startup.
+# This guard must run before ANY third-party imports (streamlit, streamlit-tour, etc.)
+# so that the policy denial fires even when WebUI dependencies are broken or missing.
+# Only standard-library and pilot-policy imports are allowed above this line.
+import os as _os
+import sys as _sys
+
+# Ensure project root is on sys.path so pilot_policy can be found.
+_root_dir = _os.path.dirname(_os.path.dirname(_os.path.realpath(__file__)))
+if _root_dir not in _sys.path:
+    _sys.path.insert(0, _root_dir)
+
+from app.services.pilot_policy import get_pilot_policy as _get_pilot_policy
+
+_policy = _get_pilot_policy()
+if _policy is not None:
+    _policy.require_not_webui()
+
+# ---------------------------------------------------------------------------
+# Third-party and application imports follow below — only reached when the
+# pilot policy allows WebUI startup (i.e. pilot mode is not active).
+# ---------------------------------------------------------------------------
+
 import hashlib
 import html
 import json
