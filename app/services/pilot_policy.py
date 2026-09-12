@@ -251,10 +251,19 @@ def get_pilot_policy() -> PilotPolicy | None:
     Returns None when MPT_PILOT_PROFILE is not set to 'braintrustcrypto'.
     Raises PilotPolicyError when the profile is active but the policy is
     missing, malformed, or contains unsafe values.
-    Result is cached after first call.
+    The parsed policy is cached after first call; a cached active policy
+    is re-checked for file presence so a removed policy file still fails
+    closed.
     """
     global _cached_policy, _policy_loaded
     if _policy_loaded:
+        if _cached_policy is not None and not Path(
+            _cached_policy.policy_path
+        ).is_file():
+            raise PilotPolicyError(
+                f"pilot policy file not found: {_cached_policy.policy_path}",
+                policy_path=_cached_policy.policy_path,
+            )
         return _cached_policy
 
     _cached_policy = load_pilot_policy()

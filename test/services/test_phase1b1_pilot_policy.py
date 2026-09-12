@@ -63,16 +63,40 @@ class TestMissingPolicyFailsClosed:
 
     def test_load_pilot_policy_missing_file(self, tmp_path, monkeypatch):
         monkeypatch.setenv("MPT_PILOT_PROFILE", "braintrustcrypto")
-        # Point root_dir at tmp_path so hardening.toml is missing
+        # Resolve the module inside the empty tmp_path sandbox so root_dir
+        # (Path(__file__).resolve().parent.parent.parent) lands in tmp_path
+        # and hardening.toml is genuinely missing. Patching module __file__
+        # keeps the real load path under test; the previous Path monkeypatch
+        # was a no-op against Path(__file__) and made this test depend on
+        # the physical absence of the project-root hardening.toml.
         monkeypatch.setattr(
-            "app.services.pilot_policy.Path",
-            lambda *args: tmp_path if args == ("app", "services", "pilot_policy.py") else Path(*args),
+            "app.services.pilot_policy.__file__",
+            str(tmp_path / "app" / "services" / "pilot_policy.py"),
         )
-        # Re-import to trigger load with patched path
         from app.services.pilot_policy import PilotPolicyError, load_pilot_policy
 
         with pytest.raises(PilotPolicyError, match="not found"):
             load_pilot_policy()
+
+    def test_cached_policy_file_removed_fails_closed(self, tmp_path, monkeypatch):
+        """L4C-I3 regression: a cached policy must still fail closed when
+        its hardening.toml is removed after the first successful load."""
+        monkeypatch.setenv("MPT_PILOT_PROFILE", "braintrustcrypto")
+        monkeypatch.setattr(
+            "app.services.pilot_policy.__file__",
+            str(tmp_path / "app" / "services" / "pilot_policy.py"),
+        )
+        from app.services import pilot_policy
+        from app.services.pilot_policy import PilotPolicyError
+
+        pilot_policy.reset_pilot_policy_cache()
+        policy_path = tmp_path / "hardening.toml"
+        policy_path.write_text(_valid_policy(), encoding="utf-8")
+        assert pilot_policy.get_pilot_policy() is not None
+
+        policy_path.unlink()
+        with pytest.raises(PilotPolicyError, match="not found"):
+            pilot_policy.get_pilot_policy()
 
 
 class TestMalformedPolicyFailsClosed:
