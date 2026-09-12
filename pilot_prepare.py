@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import hashlib
 import json
 import os
 import re
@@ -198,6 +199,15 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="URL",
         help="source URL for the matching --claim (repeatable, same order)",
     )
+    render.add_argument(
+        "--profile",
+        default=None,
+        choices=sorted(_RENDER_LOCAL_PROFILES),
+        help=(
+            "named production profile from the closed accepted set; "
+            "omit for the fixed default render-local profile"
+        ),
+    )
     return parser
 
 
@@ -219,6 +229,61 @@ class RenderLocalRequest:
     script_path: str
     materials: tuple[RenderLocalMaterialRequest, ...]
     claims: tuple[tuple[str, str], ...]
+    profile: str | None = None
+
+
+RENDER_LOCAL_PROFILE_BRIEFING_V1 = "braintrustcrypto-briefing-v1"
+
+
+@dataclass(frozen=True)
+class RenderLocalProfile:
+    """Immutable named render-local production profile constants.
+
+    A profile only re-tunes the fixed render-local parameters; every
+    policy, confinement, provenance, fail-closed, review, and
+    publishing protection is unchanged. Narration uses the local
+    Chatterbox server (offline, no credentials) with one fixed stock
+    synthetic voice — never cloning. Captions are generated and
+    corrected locally by faster-whisper.
+    """
+
+    name: str
+    voice_name: str
+    narration_provider: str
+    narration_model: str
+    subtitle_enabled: bool
+    subtitle_provider: str
+    video_clip_duration: int
+
+
+_RENDER_LOCAL_PROFILES = {
+    RENDER_LOCAL_PROFILE_BRIEFING_V1: RenderLocalProfile(
+        name=RENDER_LOCAL_PROFILE_BRIEFING_V1,
+        voice_name="chatterbox:default-Female",
+        narration_provider="chatterbox",
+        narration_model="chatterbox",
+        subtitle_enabled=True,
+        subtitle_provider="whisper",
+        video_clip_duration=6,
+    ),
+}
+
+
+def _resolve_render_local_profile(profile_name):
+    """Return the named profile, or None when no profile is selected.
+
+    Pure lookup with no filesystem, policy, or network access. Fails
+    closed on any unknown name with a static message that never echoes
+    the supplied value.
+    """
+    if profile_name is None:
+        return None
+    profile = _RENDER_LOCAL_PROFILES.get(profile_name)
+    if profile is None:
+        raise PrepareError(
+            "render-local profile must be one of the accepted named profiles"
+        )
+    return profile
 
 
 @dataclass(frozen=True)
@@ -267,6 +332,10 @@ class RenderLocalVerifiedRender:
     output_path: str
     output_sha256: str
     task_result: dict
+    narration_path: str | None = None
+    narration_sha256: str | None = None
+    subtitle_path: str | None = None
+    subtitle_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -308,6 +377,7 @@ def _validate_render_local_request(
     license_evidence: list[str] | tuple[str, ...],
     claims: list[str] | tuple[str, ...] | None = None,
     claim_sources: list[str] | tuple[str, ...] | None = None,
+    profile: str | None = None,
 ) -> RenderLocalRequest:
     """Pure in-memory validation of a render-local request.
 
@@ -316,6 +386,7 @@ def _validate_render_local_request(
     PrepareError message is static and never echoes supplied values or paths.
     """
     _require_pilot_policy()
+    _resolve_render_local_profile(profile)
 
     clean_topic = topic.strip()
     if not clean_topic:
@@ -391,6 +462,7 @@ def _validate_render_local_request(
         script_path=clean_script,
         materials=tuple(materials),
         claims=tuple(claim_pairs),
+        profile=profile,
     )
 
 
@@ -714,6 +786,9 @@ def _build_render_local_video_params(
     from app.services import voice
 
     staged = draft.staged
+    profile = _resolve_render_local_profile(
+        staged.loaded.request.profile
+    )
     return VideoParams(
         video_subject=staged.loaded.request.topic,
         video_script=staged.script_text,
@@ -728,11 +803,38 @@ def _build_render_local_video_params(
         video_count=1,
         video_aspect=VideoAspect.landscape.value,
         video_concat_mode=VideoConcatMode.sequential.value,
-        video_clip_duration=5,
-        voice_name=voice.NO_VOICE_NAME,
-        subtitle_enabled=False,
+        video_clip_duration=(
+            profile.video_clip_duration if profile is not None else 5
+        ),
+        voice_name=(
+            profile.voice_name if profile is not None else voice.NO_VOICE_NAME
+        ),
+        subtitle_enabled=(
+            profile.subtitle_enabled if profile is not None else False
+        ),
         bgm_type="none",
     )
+
+
+def _require_generated_task_file(
+    task_dir: str, name: str, description: str
+) -> str:
+    """Confine an expected renderer-generated file inside task_dir.
+
+    Requires a regular, non-linked, non-empty direct child of the task
+    directory. Every failure raises a static PrepareError.
+    """
+    lexical = os.path.abspath(os.path.join(task_dir, name))
+    resolved = os.path.realpath(lexical)
+    if os.path.normcase(lexical) != os.path.normcase(resolved):
+        raise PrepareError(f"{description} contains a link or junction")
+    if not os.path.isfile(resolved):
+        raise PrepareError(
+            f"{description} must be an existing regular file"
+        )
+    if os.path.getsize(resolved) == 0:
+        raise PrepareError(f"{description} must not be empty")
+    return resolved
 
 
 def _verify_render_local_render(
@@ -766,6 +868,9 @@ def _verify_render_local_render(
 
     staged = draft.staged
     task_dir = staged.task_dir
+    profile = _resolve_render_local_profile(
+        staged.loaded.request.profile
+    )
 
     # 1. task.start successful completion contract. An explicit
     # state/progress snapshot must have BOTH fields complete; a lone
@@ -845,14 +950,35 @@ def _verify_render_local_render(
         raise PrepareError(
             "render-local params video_concat_mode must be sequential"
         )
-    if params.get("video_clip_duration") != 5:
-        raise PrepareError("render-local params video_clip_duration must be 5")
-    if params.get("voice_name") != voice.NO_VOICE_NAME:
-        raise PrepareError("render-local params voice_name must be no-voice")
-    if params.get("subtitle_enabled") is not False:
-        raise PrepareError(
-            "render-local params subtitle_enabled must be false"
-        )
+    if profile is None:
+        if params.get("video_clip_duration") != 5:
+            raise PrepareError(
+                "render-local params video_clip_duration must be 5"
+            )
+        if params.get("voice_name") != voice.NO_VOICE_NAME:
+            raise PrepareError(
+                "render-local params voice_name must be no-voice"
+            )
+        if params.get("subtitle_enabled") is not False:
+            raise PrepareError(
+                "render-local params subtitle_enabled must be false"
+            )
+    else:
+        if params.get("video_clip_duration") != profile.video_clip_duration:
+            raise PrepareError(
+                "render-local params video_clip_duration disagrees with "
+                "the selected profile"
+            )
+        if params.get("voice_name") != profile.voice_name:
+            raise PrepareError(
+                "render-local params voice_name disagrees with the "
+                "selected profile"
+            )
+        if params.get("subtitle_enabled") is not profile.subtitle_enabled:
+            raise PrepareError(
+                "render-local params subtitle_enabled disagrees with the "
+                "selected profile"
+            )
     if params.get("bgm_type") != "none":
         raise PrepareError("render-local params bgm_type must be none")
 
@@ -945,6 +1071,28 @@ def _verify_render_local_render(
             "render-local output must be readable for hashing"
         ) from exc
 
+    # 7. Profile-generated narration and subtitle evidence. With a named
+    # profile, the confined, regular, non-empty task-local narration audio
+    # and generated subtitle files must exist and hash cleanly.
+    narration_path = None
+    narration_sha256 = None
+    subtitle_path = None
+    subtitle_sha256 = None
+    if profile is not None:
+        narration_path = _require_generated_task_file(
+            task_dir, "audio.mp3", "render-local narration audio"
+        )
+        subtitle_path = _require_generated_task_file(
+            task_dir, "subtitle.srt", "render-local generated subtitle"
+        )
+        try:
+            narration_sha256 = prov.sha256_file_streamed(narration_path)
+            subtitle_sha256 = prov.sha256_file_streamed(subtitle_path)
+        except (prov.ProvenanceError, OSError) as exc:
+            raise PrepareError(
+                "render-local generated files must be readable for hashing"
+            ) from exc
+
     return RenderLocalVerifiedRender(
         draft=draft,
         script_json_path=script_json_path,
@@ -952,6 +1100,10 @@ def _verify_render_local_render(
         output_path=output_path,
         output_sha256=output_sha256,
         task_result=dict(task_result),
+        narration_path=narration_path,
+        narration_sha256=narration_sha256,
+        subtitle_path=subtitle_path,
+        subtitle_sha256=subtitle_sha256,
     )
 
 
@@ -1025,6 +1177,9 @@ def _finalize_render_local_marked_output(
     staged = draft.staged
     task_dir = staged.task_dir
     manifest_path = draft.manifest_path
+    profile = _resolve_render_local_profile(
+        staged.loaded.request.profile
+    )
 
     # 1. Durably reread the prepared manifest; capture exact bytes.
     try:
@@ -1123,12 +1278,72 @@ def _finalize_render_local_marked_output(
                 "render-local marked output hash mismatch"
             )
 
+        ai_generations = durable["ai_generations"]
+        assets = durable["assets"]
+        if profile is not None:
+            if (
+                prov.sha256_file_streamed(verified.narration_path)
+                != verified.narration_sha256
+            ):
+                raise PrepareError(
+                    "render-local narration audio hash changed since "
+                    "verification"
+                )
+            if (
+                prov.sha256_file_streamed(verified.subtitle_path)
+                != verified.subtitle_sha256
+            ):
+                raise PrepareError(
+                    "render-local generated subtitle hash changed since "
+                    "verification"
+                )
+            narration_entry = prov.build_ai_generation(
+                provider=profile.narration_provider,
+                model=profile.narration_model,
+                generation_timestamp=prov.utc_now_iso(),
+                output_type="audio",
+                prompt_hash=hashlib.sha256(
+                    staged.script_text.encode("utf-8")
+                ).hexdigest(),
+                parameters={
+                    "voice_name": profile.voice_name,
+                    "audio_local_path": os.path.relpath(
+                        verified.narration_path, os.path.realpath(task_dir)
+                    ),
+                    "audio_sha256": verified.narration_sha256,
+                },
+            )
+            ai_generations = [*durable["ai_generations"], narration_entry]
+            subtitle_asset = prov.build_asset(
+                task_dir,
+                asset_type="subtitle",
+                source_type="ai_generated",
+                local_path=os.path.relpath(
+                    verified.subtitle_path, os.path.realpath(task_dir)
+                ),
+                license_name=(
+                    "Task-derived generated subtitle "
+                    "(operator-provided script)"
+                ),
+                license_evidence=(
+                    "urn:braintrustcrypto:task:"
+                    + staged.task_id
+                    + ":generated-subtitle"
+                ),
+                provider="faster-whisper",
+            )
+            if subtitle_asset["sha256"] != verified.subtitle_sha256:
+                raise PrepareError(
+                    "render-local generated subtitle hash mismatch"
+                )
+            assets = [*durable["assets"], subtitle_asset]
+
         rebuilt = prov.build_manifest(
             task=durable["task"],
             script=durable["script"],
-            assets=durable["assets"],
+            assets=assets,
             factual_claims=durable["factual_claims"],
-            ai_generations=durable["ai_generations"],
+            ai_generations=ai_generations,
             output=output_section,
         )
         prov.validate_manifest(rebuilt)
@@ -1185,6 +1400,7 @@ def _run_render_local_task(
     license_evidence: list[str] | tuple[str, ...],
     claims: list[str] | tuple[str, ...] | None = None,
     claim_sources: list[str] | tuple[str, ...] | None = None,
+    profile: str | None = None,
 ) -> RenderLocalFinalizedRender:
     """Run the render-local pipeline end to end, internally.
 
@@ -1208,6 +1424,7 @@ def _run_render_local_task(
         license_evidence=license_evidence,
         claims=claims,
         claim_sources=claim_sources,
+        profile=profile,
     )
     loaded = _load_render_local_inputs(request)
     staged = _stage_render_local_task(loaded)
@@ -1216,6 +1433,20 @@ def _run_render_local_task(
 
     from app.services import task
 
+    # A named profile selects the local whisper subtitle provider for the
+    # duration of the render only; the previous in-memory value is
+    # restored on every success or failure path.
+    active_profile = _resolve_render_local_profile(
+        getattr(request, "profile", None)
+    )
+    previous_provider = None
+    if active_profile is not None:
+        from app.config import config as _app_config
+
+        previous_provider = _app_config.app.get("subtitle_provider")
+        _app_config.app["subtitle_provider"] = (
+            active_profile.subtitle_provider
+        )
     try:
         task_result = task.start(
             task_id=staged.task_id,
@@ -1224,6 +1455,12 @@ def _run_render_local_task(
         )
     except Exception as exc:
         raise PrepareError("render-local render failed") from exc
+    finally:
+        if active_profile is not None:
+            if previous_provider is None:
+                _app_config.app.pop("subtitle_provider", None)
+            else:
+                _app_config.app["subtitle_provider"] = previous_provider
 
     verified = _verify_render_local_render(draft, task_result)
     return _finalize_render_local_marked_output(verified)
@@ -1403,6 +1640,7 @@ def render_local(args) -> int:
         license_evidence=args.license_evidence,
         claims=args.claim,
         claim_sources=args.claim_source,
+        profile=args.profile,
     )
     task_dir = finalized.verified.draft.staged.task_dir
     print("BrainTrustCrypto pilot render-local finalized")

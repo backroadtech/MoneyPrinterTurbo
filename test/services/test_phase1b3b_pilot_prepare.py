@@ -3600,7 +3600,7 @@ class TestRunRenderLocalTaskOrchestration(_PrepareTestBase):
         )
 
         # Raw arguments forwarded unchanged to the validator.
-        validate_mock.assert_called_once_with(**raw)
+        validate_mock.assert_called_once_with(**raw, profile=None)
         for key, value in raw.items():
             self.assertIs(calls["validate"][1][key], value)
 
@@ -4241,6 +4241,7 @@ class TestRenderLocalCLI(_PrepareTestBase):
                 "https://example.org/zz",
                 "https://example.org/aa",
             ],
+            profile=None,
         )
         prepare_mock.assert_not_called()
         self.assertEqual(after - before, set())
@@ -4461,6 +4462,7 @@ class TestRenderLocalCLI(_PrepareTestBase):
             license_evidence=["ref-z"],
             claims=[],
             claim_sources=[],
+            profile=None,
         )
         prepare_mock.assert_not_called()
         self.assertEqual(after - before, set())
