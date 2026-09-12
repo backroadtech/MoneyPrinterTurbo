@@ -1433,19 +1433,28 @@ def _run_render_local_task(
 
     from app.services import task
 
-    # A named profile selects the local whisper subtitle provider for the
-    # duration of the render only; the previous in-memory value is
-    # restored on every success or failure path.
+    # A named profile selects the local whisper subtitle provider and the
+    # profiled caption correction mode for the duration of the render
+    # only; the previous in-memory values are restored on every success
+    # or failure path.
     active_profile = _resolve_render_local_profile(
         getattr(request, "profile", None)
     )
     previous_provider = None
+    previous_correction_mode = None
     if active_profile is not None:
         from app.config import config as _app_config
+        from app.services import subtitle as _subtitle_service
 
         previous_provider = _app_config.app.get("subtitle_provider")
         _app_config.app["subtitle_provider"] = (
             active_profile.subtitle_provider
+        )
+        previous_correction_mode = _app_config.app.get(
+            "subtitle_correction_mode"
+        )
+        _app_config.app["subtitle_correction_mode"] = (
+            _subtitle_service.SUBTITLE_CORRECTION_MODE_PROFILED
         )
     try:
         task_result = task.start(
@@ -1461,6 +1470,12 @@ def _run_render_local_task(
                 _app_config.app.pop("subtitle_provider", None)
             else:
                 _app_config.app["subtitle_provider"] = previous_provider
+            if previous_correction_mode is None:
+                _app_config.app.pop("subtitle_correction_mode", None)
+            else:
+                _app_config.app["subtitle_correction_mode"] = (
+                    previous_correction_mode
+                )
 
     verified = _verify_render_local_render(draft, task_result)
     return _finalize_render_local_marked_output(verified)

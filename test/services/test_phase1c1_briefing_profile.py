@@ -38,6 +38,8 @@ from test.services.test_phase1b3b_pilot_prepare import (
     _PatchedPath,
 )
 
+from app.services import subtitle as subtitle_mod
+
 PROFILE_NAME = pilot_prepare.RENDER_LOCAL_PROFILE_BRIEFING_V1
 PROFILE = pilot_prepare._RENDER_LOCAL_PROFILES[PROFILE_NAME]
 STOCK_VOICE = "chatterbox:default-Female"
@@ -485,6 +487,175 @@ class TestBriefingProfileFinalization(_BriefingProfileBase):
         self.assertEqual(len(manifest["assets"]), 1)
         self.assertEqual(manifest["output"]["sha256"], hashes["output"])
         prov.validate_manifest(manifest)
+
+
+class TestBriefingProfileCaptionCorrection(unittest.TestCase):
+    """Profiled caption correction: monotonic partition + fail-closed validation.
+
+    Fixtures mirror the Proof 003 defect: script lines split on commas and
+    line wraps while whisper segments split on phrase boundaries, which made
+    the legacy greedy alignment drift progressively and fabricate
+    zero-duration tail cues.
+    """
+
+    WHISPER_SRT = (
+        "1\n00:00:00,000 --> 00:00:02,000\nBitcoin is a shared ledger\n\n"
+        "2\n00:00:02,000 --> 00:00:03,500\nthat no single party controls\n\n"
+        "3\n00:00:03,800 --> 00:00:05,000\nNodes reject what the rules\n\n"
+        "4\n00:00:05,000 --> 00:00:05,600\ndo not allow\n\n"
+        "5\n00:00:05,800 --> 00:00:07,200\nso ownership is proven by mathematics\n\n"
+        "6\n00:00:07,400 --> 00:00:08,000\nnot promises\n\n"
+        "7\n00:00:08,300 --> 00:00:09,000\nConsensus decides\n\n"
+        "8\n00:00:09,000 --> 00:00:09,800\nwhich history stands\n\n"
+    )
+    SCRIPT = (
+        "Bitcoin is a shared ledger that no single party controls.\n"
+        "Nodes reject what the rules do not\n"
+        "allow, so ownership is proven by mathematics, not promises.\n"
+        "Consensus decides which history stands.\n"
+    )
+    SCRIPT_LINES = (
+        "Bitcoin is a shared ledger that no single party controls",
+        "Nodes reject what the rules do not",
+        "allow",
+        "so ownership is proven by mathematics",
+        "not promises",
+        "Consensus decides which history stands",
+    )
+    NARRATION_END = 9.8
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.srt = os.path.join(self._tmp.name, "subtitle.srt")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write(self, content):
+        with open(self.srt, "w", encoding="utf-8") as fd:
+            fd.write(content)
+
+    def _run_profiled(self):
+        self._write(self.WHISPER_SRT)
+        subtitle_mod.correct(
+            subtitle_file=self.srt,
+            video_script=self.SCRIPT,
+            correction_mode=subtitle_mod.SUBTITLE_CORRECTION_MODE_PROFILED,
+        )
+        cues = []
+        for _, times, text in subtitle_mod.file_to_subtitles(self.srt):
+            start_raw, end_raw = times.split(" --> ")
+            cues.append(
+                (
+                    subtitle_mod._srt_time_to_seconds(start_raw),
+                    subtitle_mod._srt_time_to_seconds(end_raw),
+                    text,
+                )
+            )
+        return cues
+
+    def test_exact_ordered_script_text_preserved(self):
+        cues = self._run_profiled()
+        self.assertEqual([text for _, _, text in cues], list(self.SCRIPT_LINES))
+
+    def test_progressive_drift_prevented(self):
+        cues = self._run_profiled()
+        by_text = {text: (start, end) for start, end, text in cues}
+        # The legacy greedy alignment drifted both of these cues late.
+        self.assertEqual(by_text["allow"], (5.0, 5.6))
+        self.assertEqual(
+            by_text["Consensus decides which history stands"], (8.3, 9.8)
+        )
+
+    def test_every_cue_valid_monotonic_in_range(self):
+        cues = self._run_profiled()
+        previous_end = 0.0
+        for start, end, text in cues:
+            self.assertLess(start, end)
+            self.assertGreaterEqual(start, previous_end)
+            self.assertGreaterEqual(start, 0.0)
+            self.assertLessEqual(end, self.NARRATION_END)
+            self.assertTrue(text.strip())
+            previous_end = end
+
+    def test_final_stanza_coverage(self):
+        cues = self._run_profiled()
+        self.assertEqual(cues[-1][1], self.NARRATION_END)
+        self.assertEqual(cues[-1][2], self.SCRIPT_LINES[-1])
+
+    def test_zero_duration_rejected(self):
+        with self.assertRaises(subtitle_mod.SubtitleCorrectionError):
+            subtitle_mod._validate_profiled_cues(
+                [(0.0, 0.0, "text")], self.NARRATION_END, ["text"]
+            )
+
+    def test_empty_text_rejected(self):
+        with self.assertRaises(subtitle_mod.SubtitleCorrectionError):
+            subtitle_mod._validate_profiled_cues(
+                [(0.0, 1.0, "  ")], self.NARRATION_END, ["x"]
+            )
+
+    def test_non_monotonic_rejected(self):
+        with self.assertRaises(subtitle_mod.SubtitleCorrectionError):
+            subtitle_mod._validate_profiled_cues(
+                [(0.0, 2.0, "a"), (1.0, 3.0, "b")],
+                self.NARRATION_END,
+                ["a", "b"],
+            )
+
+    def test_out_of_range_rejected(self):
+        with self.assertRaises(subtitle_mod.SubtitleCorrectionError):
+            subtitle_mod._validate_profiled_cues(
+                [(0.0, 9.0, "a"), (9.0, 10.5, "b")],
+                self.NARRATION_END,
+                ["a", "b"],
+            )
+
+    def test_incomplete_tail_rejected(self):
+        with self.assertRaises(subtitle_mod.SubtitleCorrectionError):
+            subtitle_mod._validate_profiled_cues(
+                [(0.0, 5.0, "a"), (5.0, 9.0, "b")],
+                self.NARRATION_END,
+                ["a", "b"],
+            )
+
+    def test_insufficient_timing_coverage_fails_closed(self):
+        short_srt = (
+            "1\n00:00:00,000 --> 00:00:01,000\nonly one\n\n"
+            "2\n00:00:01,000 --> 00:00:02,000\nshort cue\n\n"
+        )
+        self._write(short_srt)
+        with self.assertRaises(subtitle_mod.SubtitleCorrectionError):
+            subtitle_mod.correct(
+                subtitle_file=self.srt,
+                video_script=self.SCRIPT,
+                correction_mode=subtitle_mod.SUBTITLE_CORRECTION_MODE_PROFILED,
+            )
+        # Fail-closed: the whisper file must remain untouched on failure.
+        with open(self.srt, "r", encoding="utf-8") as fd:
+            self.assertEqual(fd.read(), short_srt)
+
+    def test_legacy_behavior_unchanged_without_mode(self):
+        self._write(self.WHISPER_SRT)
+        subtitle_mod.correct(subtitle_file=self.srt, video_script=self.SCRIPT)
+        with open(self.srt, "r", encoding="utf-8") as fd:
+            legacy = fd.read()
+        # Legacy greedy alignment drifts: "allow" steals the timing of the
+        # "so ownership ..." whisper segment. Preserved exactly.
+        self.assertIn("00:00:05,800 --> 00:00:07,200\nallow\n", legacy)
+
+    def test_legacy_zero_placeholder_tail_unchanged(self):
+        short_srt = (
+            "1\n00:00:00,000 --> 00:00:01,000\nonly one\n\n"
+            "2\n00:00:01,000 --> 00:00:02,000\nshort cue\n\n"
+        )
+        self._write(short_srt)
+        subtitle_mod.correct(subtitle_file=self.srt, video_script=self.SCRIPT)
+        with open(self.srt, "r", encoding="utf-8") as fd:
+            legacy = fd.read()
+        # Legacy tail handling fabricates zero-duration placeholders; the
+        # profile is what rejects them — legacy behavior stays unchanged.
+        self.assertIn("00:00:00,000 --> 00:00:00,000", legacy)
 
 
 if __name__ == "__main__":
