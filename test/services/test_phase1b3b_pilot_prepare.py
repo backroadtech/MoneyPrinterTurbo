@@ -1787,9 +1787,12 @@ class TestRenderLocalVerifiedRenderSemantics(_PrepareTestBase):
         draft = pilot_prepare._prepare_render_local_draft(staged)
         task_dir = staged.task_dir
 
-        # 2. Fixture-shaped script.json: exact prepared script + fixed params.
+        # 2. Fixture-shaped script.json: the renderer persists the
+        #    stripped prepared script as the derived top-level field
+        #    (generate_script normalization); params keep the prepared
+        #    script byte-for-byte.
         script_json_fixture = {
-            "script": staged.script_text,
+            "script": staged.script_text.strip(),
             "params": {
                 "video_script": staged.script_text,
                 "video_source": "local",
@@ -1970,6 +1973,46 @@ class TestRenderLocalVerifiedRenderSemantics(_PrepareTestBase):
         self.assertEqual(verified.task_result, task_result)
         self.assertEqual(self.tree_snapshot(task_dir), before_tree)
 
+    def test_renderer_normalized_derived_script_accepted(self):
+        (
+            draft,
+            script_json_target,
+            script_json_fixture,
+            output_target,
+            output_bytes,
+        ) = self.build_verifiable_fixtures()
+        staged = draft.staged
+        task_dir = staged.task_dir
+
+        # The prepared script keeps its trailing newline; the derived
+        # top-level script is the renderer-normalized (stripped) form,
+        # while params.video_script pins the prepared script byte-for-
+        # byte. The whitespace difference must exist for this test to
+        # prove acceptance of the normalized derived field.
+        self.assertNotEqual(staged.script_text, staged.script_text.strip())
+        self.assertEqual(
+            script_json_fixture["script"], staged.script_text.strip()
+        )
+        self.assertEqual(
+            script_json_fixture["params"]["video_script"],
+            staged.script_text,
+        )
+
+        task_result = {
+            "state": const.TASK_STATE_COMPLETE,
+            "progress": 100,
+        }
+        before_tree = self.tree_snapshot(task_dir)
+        verified = pilot_prepare._verify_render_local_render(
+            draft, task_result
+        )
+        self.assertIs(verified.draft, draft)
+        self.assertEqual(
+            verified.output_sha256,
+            hashlib.sha256(output_bytes).hexdigest(),
+        )
+        self.assertEqual(self.tree_snapshot(task_dir), before_tree)
+
     # -- task-result refusals -------------------------------------------------
 
     def test_incomplete_or_mismatched_task_result_refused(self):
@@ -2095,6 +2138,16 @@ class TestRenderLocalVerifiedRenderSemantics(_PrepareTestBase):
              "render-local params video_script disagrees with the "
              "prepared script",
              ("altered video script CANARY-ds2", staged.script_text)),
+            ("top-level script not renderer-normalized",
+             ("script",), staged.script_text,
+             "render-local script manifest script disagrees with the "
+             "prepared script",
+             (staged.script_text,)),
+            ("params video_script whitespace-only",
+             ("params", "video_script"), staged.script_text.strip(),
+             "render-local params video_script disagrees with the "
+             "prepared script",
+             (staged.script_text,)),
             ("video_source",
              ("params", "video_source"), "pexels-CANARY-ds3",
              "render-local params video_source must be local",
@@ -2612,7 +2665,7 @@ class TestRenderLocalMarkedOutputFinalization(_PrepareTestBase):
         task_dir = staged.task_dir
 
         script_json = {
-            "script": staged.script_text,
+            "script": staged.script_text.strip(),
             "params": {
                 "video_script": staged.script_text,
                 "video_source": "local",
@@ -3905,9 +3958,10 @@ class TestRunRenderLocalTaskOrchestration(_PrepareTestBase):
             ) as handle:
                 captured["draft_manifest"] = json.load(handle)
 
-            # Fixture-shaped script.json built from the received params.
+            # Fixture-shaped script.json built from the received params;
+            # the real renderer persists the stripped derived script.
             script_json = {
-                "script": params.video_script,
+                "script": params.video_script.strip(),
                 "params": {
                     "video_script": params.video_script,
                     "video_source": params.video_source,

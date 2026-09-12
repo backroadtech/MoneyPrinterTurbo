@@ -751,7 +751,8 @@ def _verify_render_local_render(
     output references, where present, must agree with the prepared
     draft. script.json is resolved inside the
     confined prepared task directory and must be a regular, non-linked
-    JSON object whose script and params match the prepared evidence
+    JSON object whose derived script matches the renderer-normalized
+    prepared script and whose params match the prepared evidence
     exactly. Exactly one unmarked final-1.mp4 is required and hashed
     with the production streamed SHA-256 helper. Performs no writes,
     copies, renames, manifest updates, or cleanup. Every PrepareError
@@ -821,8 +822,12 @@ def _verify_render_local_render(
     if not isinstance(script_field, str) or not isinstance(params, dict):
         raise PrepareError("render-local script manifest has an unexpected shape")
 
-    # 3. Exact script and VideoParams evidence fields.
-    if script_field != staged.script_text:
+    # 3. Script and VideoParams evidence fields. The renderer's
+    # intentional normalization (generate_script strips a provided
+    # script before use) is persisted as the derived top-level script,
+    # so that field must equal the stripped prepared script;
+    # params.video_script keeps the prepared script byte-for-byte.
+    if script_field != staged.script_text.strip():
         raise PrepareError(
             "render-local script manifest script disagrees with the prepared script"
         )
