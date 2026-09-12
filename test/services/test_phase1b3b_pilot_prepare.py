@@ -1927,6 +1927,49 @@ class TestRenderLocalVerifiedRenderSemantics(_PrepareTestBase):
         self.assertEqual(verified.task_result, task_result)
         self.assertEqual(self.tree_snapshot(task_dir), before_tree)
 
+    def test_production_success_shape_without_state_fields_accepted(self):
+        (
+            draft,
+            _script_json_target,
+            _script_json_fixture,
+            output_target,
+            output_bytes,
+        ) = self.build_verifiable_fixtures()
+        task_dir = draft.staged.task_dir
+
+        # The established production success return (the full
+        # stop_at="video" pipeline result) carries no state/progress
+        # keys; the renderer outputs key is required instead and is
+        # validated exactly below. task_id stays optional.
+        output_rel = os.path.relpath(output_target, task_dir)
+        task_result = {
+            "videos": [output_rel],
+            "combined_videos": ["combined-1.mp4"],
+            "script": draft.staged.script_text,
+            "terms": "",
+            "audio_file": "audio.mp3",
+            "audio_duration": 63.53,
+            "subtitle_path": "",
+            "materials": [],
+            "cross_post_state": None,
+            "cross_post_results": None,
+            "cross_post_error": None,
+            "cross_post_owner": None,
+            "warnings": None,
+        }
+        before_tree = self.tree_snapshot(task_dir)
+        verified = pilot_prepare._verify_render_local_render(
+            draft, task_result
+        )
+
+        self.assertIs(verified.draft, draft)
+        self.assertEqual(
+            verified.output_sha256,
+            hashlib.sha256(output_bytes).hexdigest(),
+        )
+        self.assertEqual(verified.task_result, task_result)
+        self.assertEqual(self.tree_snapshot(task_dir), before_tree)
+
     # -- task-result refusals -------------------------------------------------
 
     def test_incomplete_or_mismatched_task_result_refused(self):
@@ -1968,6 +2011,23 @@ class TestRenderLocalVerifiedRenderSemantics(_PrepareTestBase):
             ("incomplete progress",
              {**success, "progress": 50},
              "render-local task result progress is not complete",
+             ()),
+            ("state without progress",
+             {"state": const.TASK_STATE_COMPLETE, "videos": [output_rel]},
+             "render-local task result progress is not complete",
+             ()),
+            ("progress without state",
+             {"progress": 100, "videos": [output_rel]},
+             "render-local task result state is not complete",
+             ()),
+            ("no state fields and no renderer outputs",
+             {"combined_videos": ["combined-1.mp4"]},
+             "render-local task result must carry the production success "
+             "shape",
+             ()),
+            ("no state fields with empty outputs",
+             {"videos": []},
+             disagree,
              ()),
             ("mismatched task id",
              {**success, "task_id": wrong_task_id},
@@ -3873,11 +3933,25 @@ class TestRunRenderLocalTaskOrchestration(_PrepareTestBase):
                 os.path.join(task_dir, "final-1.mp4"), "wb"
             ) as handle:
                 handle.write(output_bytes)
+            # Real production success shape (the full stop_at="video"
+            # pipeline result): no state/progress/task_id keys; the
+            # renderer outputs prove completion.
             return {
-                "task_id": task_id,
-                "state": const.TASK_STATE_COMPLETE,
-                "progress": 100,
-                "videos": ["final-1.mp4"],
+                "videos": [os.path.join(task_dir, "final-1.mp4")],
+                "combined_videos": [
+                    os.path.join(task_dir, "combined-1.mp4")
+                ],
+                "script": params.video_script,
+                "terms": "",
+                "audio_file": os.path.join(task_dir, "audio.mp3"),
+                "audio_duration": 63.53,
+                "subtitle_path": "",
+                "materials": [],
+                "cross_post_state": None,
+                "cross_post_results": None,
+                "cross_post_error": None,
+                "cross_post_owner": None,
+                "warnings": None,
             }
 
         fake_task_module = unittest.mock.Mock()

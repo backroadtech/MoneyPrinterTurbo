@@ -742,10 +742,14 @@ def _verify_render_local_render(
     """Verify post-render evidence for a prepared draft, strictly read-only.
 
     The task result must satisfy the successful completion contract: a
-    non-empty mapping with state TASK_STATE_COMPLETE and progress 100,
-    so a failed task that happened to leave final-1.mp4 behind never
-    qualifies; task ID and output references, where present, must agree
-    with the prepared draft. script.json is resolved inside the
+    non-empty mapping carrying either an explicit state/progress
+    snapshot with BOTH state TASK_STATE_COMPLETE and progress 100, or
+    the established production success shape with the renderer outputs
+    present and no state/progress keys at all. A lone state or progress
+    field is rejected, as is any FAILED state, so a failed task that
+    happened to leave final-1.mp4 behind never qualifies; task ID and
+    output references, where present, must agree with the prepared
+    draft. script.json is resolved inside the
     confined prepared task directory and must be a regular, non-linked
     JSON object whose script and params match the prepared evidence
     exactly. Exactly one unmarked final-1.mp4 is required and hashed
@@ -762,15 +766,31 @@ def _verify_render_local_render(
     staged = draft.staged
     task_dir = staged.task_dir
 
-    # 1. task.start successful completion contract.
+    # 1. task.start successful completion contract. An explicit
+    # state/progress snapshot must have BOTH fields complete; a lone
+    # field is rejected. The established production success return (the
+    # full stop_at="video" pipeline result) carries no state/progress
+    # keys at all; there the renderer outputs key is required and
+    # section 5 validates it exactly. A FAILED state never qualifies,
+    # even when final-1.mp4 exists.
     if not isinstance(task_result, dict) or not task_result:
         raise PrepareError(
             "render-local task result must be a non-empty mapping"
         )
-    if task_result.get("state") != const.TASK_STATE_COMPLETE:
-        raise PrepareError("render-local task result state is not complete")
-    if task_result.get("progress") != 100:
-        raise PrepareError("render-local task result progress is not complete")
+    if "state" in task_result or "progress" in task_result:
+        if task_result.get("state") != const.TASK_STATE_COMPLETE:
+            raise PrepareError(
+                "render-local task result state is not complete"
+            )
+        if task_result.get("progress") != 100:
+            raise PrepareError(
+                "render-local task result progress is not complete"
+            )
+    elif "videos" not in task_result:
+        raise PrepareError(
+            "render-local task result must carry the production success "
+            "shape"
+        )
     if "task_id" in task_result and task_result["task_id"] != staged.task_id:
         raise PrepareError(
             "render-local task result task ID disagrees with the prepared draft"
